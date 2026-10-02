@@ -1,0 +1,9 @@
+Added :meth:`pluggy.PluginManager.check_hookspec_compatibility`, a read-only
+entry point which checks already-registered plugins against candidate hook
+specification declarations and returns a
+:class:`~pluggy.HookspecCompatibility` report of per-plugin
+:class:`~pluggy.HookspecConflict` entries (removed arguments, required/optional
+argument changes, keyword-only positional restrictions, ``firstresult`` and
+wrapper/``historic`` protocol changes). The check reuses the exact validation
+rules enforced at registration time, never installs the candidate hookspecs,
+never mutates the manager, and never executes hook implementations.

@@ -16,6 +16,8 @@ import warnings
 from . import _tracing
 from ._callers import _multicall
 from ._compat import DistFacade
+from ._compatibility import check_compatibility
+from ._compatibility import iter_hook_violations
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
 from ._hooks import _Plugin
@@ -31,6 +33,8 @@ from ._result import Result
 
 if TYPE_CHECKING:
     import importlib.metadata
+
+    from ._compatibility import HookspecCompatibility
 
 
 _BeforeTrace: TypeAlias = Callable[[str, Sequence[HookImpl], Mapping[str, Any]], None]
@@ -414,29 +418,15 @@ class PluginManager:
         return None
 
     def _verify_hook(self, hook: HookCaller, hookimpl: HookImpl) -> None:
-        if hook.is_historic() and (hookimpl.hookwrapper or hookimpl.wrapper):
-            raise PluginValidationError(
-                hookimpl.plugin,
-                f"Plugin {hookimpl.plugin_name!r}\nhook {hook.name!r}\n"
-                "historic incompatible with yield/wrapper/hookwrapper",
-            )
-
         assert hook.spec is not None
         if hook.spec.warn_on_impl:
             _warn_for_function(hook.spec.warn_on_impl, hookimpl.function)
 
-        # positional arg checking
-        notinspec = set(hookimpl.argnames) - (
-            set(hook.spec.argnames) | set(hook.spec.kwargnames)
-        )
-        if notinspec:
-            raise PluginValidationError(
-                hookimpl.plugin,
-                f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
-                f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
-                f"Argument(s) {notinspec} are declared in the hookimpl but "
-                "can not be found in the hookspec",
-            )
+        # The hard validation rules live next to the read-only compatibility
+        # check (pluggy._compatibility) so both always reach the same verdict.
+        violation = next(iter_hook_violations(hook.name, hook.spec, hookimpl), None)
+        if violation is not None:
+            raise PluginValidationError(hookimpl.plugin, violation.message)
 
         if hook.spec.warn_on_impl_args:
             for hookimpl_argname in hookimpl.argnames + hookimpl.kwargnames:
@@ -444,24 +434,36 @@ class PluginManager:
                 if argname_warning is not None:
                     _warn_for_function(argname_warning, hookimpl.function)
 
-        if (
-            hookimpl.wrapper or hookimpl.hookwrapper
-        ) and not inspect.isgeneratorfunction(hookimpl.function):
-            raise PluginValidationError(
-                hookimpl.plugin,
-                f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
-                f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
-                "Declared as wrapper=True or hookwrapper=True "
-                "but function is not a generator function",
-            )
+    def check_hookspec_compatibility(
+        self, module_or_class: _Namespace
+    ) -> HookspecCompatibility:
+        """Check installed plugins against candidate hook specifications.
 
-        if hookimpl.wrapper and hookimpl.hookwrapper:
-            raise PluginValidationError(
-                hookimpl.plugin,
-                f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
-                f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
-                "The wrapper=True and hookwrapper=True options are mutually exclusive",
-            )
+        Performs a read-only compatibility check: it compares the hook
+        specifications currently installed in this manager with the candidate
+        declarations found in ``module_or_class`` (a module or class marked
+        with the matching :class:`HookspecMarker`, exactly as accepted by
+        :meth:`add_hookspecs`), reporting which already-registered plugins
+        would stop validating under the candidate declarations.
+
+        The check applies the very same rules enforced at registration time
+        (argument removal, required/optional argument mismatches detectable
+        from the declarations, positional/keyword-only restrictions,
+        ``firstresult`` and wrapper/``historic`` protocol changes); it never
+        installs the candidate hookspecs, never mutates this manager, and
+        never executes hook implementations. A failed check therefore leaves
+        all existing hooks and plugins untouched and still callable.
+
+        :param module_or_class:
+            The module or class holding the candidate hook specifications.
+
+        :returns:
+            A :class:`~pluggy.HookspecCompatibility` result. It is truthy
+            when every installed plugin remains compatible, and otherwise
+            carries per-plugin :class:`~pluggy.HookspecConflict` entries
+            naming the plugin, hook, and concrete conflict.
+        """
+        return check_compatibility(self, module_or_class)
 
     def check_pending(self) -> None:
         """Verify that all hooks which have not been verified against a
@@ -633,5 +635,14 @@ class PluginManager:
         return _SubsetHookCaller(orig, plugins_to_remove)
 
 
-def _formatdef(func: Callable[..., object]) -> str:
-    return f"{func.__name__}{inspect.signature(func)}"
+# ``_formatdef`` historically lived in this module. It moved next to the
+# shared validation rules in ``pluggy._compatibility``; keep the old import
+# path working for downstream code and pluggy's own test-suite.  Unguarded
+# signature on purpose: module-level ``__getattr__`` is understood by mypy
+# only without annotations.
+def __getattr__(name: str):  # type: ignore[no-untyped-def]
+    if name == "_formatdef":
+        from ._compatibility import _formatdef as _fmt
+
+        return _fmt
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

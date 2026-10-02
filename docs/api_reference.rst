@@ -12,6 +12,14 @@ API Reference
     :show-inheritance:
     :members:
 
+.. autoclass:: pluggy.HookspecCompatibility()
+    :show-inheritance:
+    :members:
+
+.. autoclass:: pluggy.HookspecConflict()
+    :show-inheritance:
+    :members:
+
 .. autodecorator:: pluggy.HookspecMarker
 
 .. autodecorator:: pluggy.HookimplMarker
