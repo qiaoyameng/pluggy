@@ -1,0 +1,1 @@
+Added ``PluginManager.subset_hook_relay()`` for read-only, call-level plugin selection by registered plugin names.

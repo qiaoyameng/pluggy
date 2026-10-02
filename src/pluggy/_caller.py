@@ -49,7 +49,11 @@ _HookRelay = HookRelay
 
 
 _CallHistory: TypeAlias = list[
-    tuple[Mapping[str, object], Callable[[Any], None] | None]
+    tuple[
+        Mapping[str, object],
+        Callable[[Any], None] | None,
+        AbstractSet[HookImpl] | None,
+    ]
 ]
 
 
@@ -215,7 +219,7 @@ class HookCaller:
         kwargs = kwargs or {}
         kwargs = self._apply_defaults(kwargs)
         self._verify_all_args_are_provided(kwargs)
-        self._call_history.append((kwargs, result_callback))
+        self._record_historic_call(kwargs, result_callback)
         # Historizing hooks don't return results.
         # Remember firstresult isn't compatible with historic.
         # Copy because plugins may register other plugins during iteration (#438).
@@ -225,6 +229,17 @@ class HookCaller:
         if isinstance(res, list):
             for x in res:
                 result_callback(x)
+
+    def _record_historic_call(
+        self,
+        kwargs: Mapping[str, object],
+        result_callback: Callable[[Any], None] | None,
+        selected_hookimpls: AbstractSet[HookImpl] | None = None,
+    ) -> None:
+        assert self._call_history is not None
+        self._call_history.append(
+            (kwargs, result_callback, selected_hookimpls)
+        )
 
     def call_extra(
         self, methods: Sequence[Callable[..., object]], kwargs: Mapping[str, object]
@@ -265,7 +280,16 @@ class HookCaller:
         """Apply call history to a new hookimpl if it is marked as historic."""
         if self.is_historic():
             assert self._call_history is not None
-            for kwargs, result_callback in self._call_history:
+            for (
+                kwargs,
+                result_callback,
+                selected_hookimpls,
+            ) in self._call_history:
+                if (
+                    selected_hookimpls is not None
+                    and method not in selected_hookimpls
+                ):
+                    continue
                 res = self._hookexec(self.name, [method], kwargs, False)
                 if res and result_callback is not None:
                     # XXX: remember firstresult isn't compat with historic
@@ -320,3 +344,54 @@ class _SubsetHookCaller(HookCaller):
 
     def __repr__(self) -> str:
         return f"<_SubsetHookCaller {self.name!r}>"
+
+
+class _SelectedHookCaller(HookCaller):
+    """A read-only caller containing hookimpls from selected plugins."""
+
+    __slots__ = (
+        "_orig",
+        "_selected_hookimpls",
+    )
+
+    def __init__(
+        self,
+        orig: HookCaller,
+        selected_plugins: AbstractSet[_Plugin],
+    ) -> None:
+        self._orig = orig
+        self._selected_hookimpls = tuple(
+            hookimpl
+            for hookimpl in orig._hookimpls
+            if hookimpl.plugin in selected_plugins
+        )
+        self.name = orig.name  # type: ignore[misc]
+        self._hookexec = orig._hookexec  # type: ignore[misc]
+
+    @property  # type: ignore[misc]
+    def _hookimpls(self) -> list[HookImpl]:
+        return list(self._selected_hookimpls)
+
+    @property
+    def spec(self) -> HookSpec | None:  # type: ignore[override]
+        return self._orig.spec
+
+    @property
+    def _call_history(self) -> _CallHistory | None:  # type: ignore[override]
+        return self._orig._call_history
+
+    def _record_historic_call(
+        self,
+        kwargs: Mapping[str, object],
+        result_callback: Callable[[Any], None] | None,
+        selected_hookimpls: AbstractSet[HookImpl] | None = None,
+    ) -> None:
+        HookCaller._record_historic_call(
+            self,
+            kwargs,
+            result_callback,
+            set(self._selected_hookimpls),
+        )
+
+    def __repr__(self) -> str:
+        return f"<_SelectedHookCaller {self.name!r}>"

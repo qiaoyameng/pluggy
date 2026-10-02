@@ -811,6 +811,245 @@ def test_subset_hook_caller_with_specname(pm: PluginManager) -> None:
     assert hc() == [2]
 
 
+def test_subset_hook_relay_selects_plugins_by_name(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self): ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self):
+            return 1
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self):
+            return 2
+
+    class Plugin3:
+        @hookimpl
+        def he_method1(self):
+            return 3
+
+    plugin1, plugin2, plugin3 = Plugin1(), Plugin2(), Plugin3()
+    pm.register(plugin1, name="plugin1")
+    pm.register(plugin2, name="plugin2")
+    pm.register(plugin3, name="plugin3")
+    original_hookimpls = pm.hook.he_method1.get_hookimpls()
+
+    selected = pm.subset_hook_relay(["plugin3", "plugin1"])
+    assert selected.he_method1() == [3, 1]
+    assert pm.hook.he_method1() == [3, 2, 1]
+    assert pm.hook.he_method1.get_hookimpls() == original_hookimpls
+
+
+def test_subset_hook_relay_rejects_unknown_and_blocked_names(
+    pm: PluginManager,
+) -> None:
+    class Plugin1:
+        pass
+
+    pm.register(Plugin1(), name="plugin1")
+    pm.set_blocked("blocked")
+
+    with pytest.raises(KeyError, match="unknown"):
+        pm.subset_hook_relay(["plugin1", "unknown"])
+    with pytest.raises(KeyError, match="blocked"):
+        pm.subset_hook_relay(["plugin1", "blocked"])
+
+
+def test_subset_hook_relay_is_not_expanded_by_later_registration(
+    pm: PluginManager,
+) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self): ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self):
+            return 1
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self):
+            return 2
+
+        @hookimpl(optionalhook=True)
+        def he_method2(self):
+            return 20
+
+    plugin1 = Plugin1()
+    pm.register(plugin1, name="plugin1")
+    selected = pm.subset_hook_relay(["plugin1"])
+
+    pm.set_blocked("plugin1")
+    assert selected.he_method1() == [1]
+    assert pm.hook.he_method1() == []
+    pm.unblock("plugin1")
+
+    pm.register(Plugin2(), name="plugin2")
+    assert selected.he_method1() == [1]
+    assert hasattr(pm.hook, "he_method2")
+    assert not hasattr(selected, "he_method2")
+
+    pm.register(Plugin2(), name="plugin1")
+    assert selected.he_method1() == [1]
+
+
+def test_subset_hook_relay_preserves_firstresult_order(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(firstresult=True)
+        def he_method1(self): ...
+
+    pm.add_hookspecs(Hooks)
+
+    class TryLast:
+        @hookimpl(trylast=True)
+        def he_method1(self):
+            return "trylast"
+
+    class Normal:
+        @hookimpl
+        def he_method1(self):
+            return "normal"
+
+    class TryFirst:
+        @hookimpl(tryfirst=True)
+        def he_method1(self):
+            return "tryfirst"
+
+    pm.register(TryLast(), name="trylast")
+    pm.register(Normal(), name="normal")
+    pm.register(TryFirst(), name="tryfirst")
+
+    assert pm.hook.he_method1() == "tryfirst"
+    selected = pm.subset_hook_relay(["trylast", "normal"])
+    assert selected.he_method1() == "normal"
+
+
+def test_subset_hook_relay_filters_wrappers(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self): ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self):
+            return "plugin1"
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self):
+            return "plugin2"
+
+    class Wrapper1:
+        @hookimpl(wrapper=True)
+        def he_method1(self):
+            return f"wrapper1:{(yield)}"
+
+    class Wrapper2:
+        @hookimpl(wrapper=True)
+        def he_method1(self):
+            return f"wrapper2:{(yield)}"
+
+    pm.register(Plugin1(), name="plugin1")
+    pm.register(Plugin2(), name="plugin2")
+    pm.register(Wrapper1(), name="wrapper1")
+    pm.register(Wrapper2(), name="wrapper2")
+
+    selected = pm.subset_hook_relay(["plugin1", "wrapper2"])
+    assert selected.he_method1() == "wrapper2:['plugin1']"
+    assert pm.subset_hook_relay(["wrapper2"]).he_method1() == "wrapper2:[]"
+    assert pm.subset_hook_relay(["plugin1"]).he_method1() == ["plugin1"]
+
+
+def test_subset_hook_relay_historic_replay(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg
+
+    plugin1 = Plugin1()
+    pm.register(plugin1, name="plugin1")
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg * 10
+
+    pm.register(Plugin2(), name="plugin2")
+
+    selected = pm.subset_hook_relay(["plugin1"])
+    results = []
+    selected.he_method1.call_historic(
+        result_callback=results.append, kwargs={"arg": 2}
+    )
+    assert results == [2]
+
+    class Plugin3:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg * 100
+
+    pm.register(Plugin3(), name="plugin3")
+    assert results == [2]
+
+    pm.unregister(plugin1)
+    pm.register(Plugin3(), name="plugin1")
+    assert results == [2]
+
+
+def test_subset_hook_relay_nested_calls_keep_outer_order(
+    pm: PluginManager,
+) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self): ...
+
+    pm.add_hookspecs(Hooks)
+    calls = []
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self):
+            calls.append(1)
+            return 1
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self):
+            calls.append(2)
+            return 2
+
+    class Plugin3:
+        @hookimpl(tryfirst=True)
+        def he_method1(self):
+            calls.append(3)
+            pm.subset_hook_relay(["plugin2"]).he_method1()
+            return 3
+
+    pm.register(Plugin1(), name="plugin1")
+    pm.register(Plugin2(), name="plugin2")
+    pm.register(Plugin3(), name="plugin3")
+
+    selected = pm.subset_hook_relay(["plugin3", "plugin1"])
+    assert selected.he_method1() == [3, 1]
+    assert calls == [3, 2, 1]
+
+
 def test_get_hookimpls(pm: PluginManager) -> None:
     class Hooks:
         @hookspec

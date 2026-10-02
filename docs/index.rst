@@ -1033,6 +1033,25 @@ You then can use that :py:class:`~pluggy.HookCaller`
 to make normal, :py:meth:`~pluggy.HookCaller.call_historic`, or
 :py:meth:`~pluggy.HookCaller.call_extra` calls as necessary.
 
+For call-level tenant selection, use
+:py:meth:`pluggy.PluginManager.subset_hook_relay()` with registered plugin
+names. It returns a read-only :py:class:`~pluggy.HookRelay` containing the
+hooks which existed when the relay was created. Plugin names are resolved to
+plugin objects and hook implementations at that time, so later registration,
+unregistration, blocking, or registration under a reused name neither adds
+nor removes participants from the view. Unknown and blocked plugin names are
+errors.
+
+For every hook, implementations from selected plugins retain the same
+relative execution order as the full manager. The same rule applies to hook
+wrappers: a wrapper participates only when its plugin is selected, and
+``firstresult`` stops according to the filtered implementation order.
+
+Historic calls made on a selected relay are supported. Their replay records
+contain the call arguments, result callback, and the selected hook
+implementations. A plugin registered after such a call receives the replay
+only if its implementation was part of that frozen selection.
+
 
 .. _tracing:
 

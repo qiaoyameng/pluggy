@@ -19,6 +19,7 @@ from ._compat import DistFacade
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
 from ._hooks import _Plugin
+from ._hooks import _SelectedHookCaller
 from ._hooks import _SubsetHookCaller
 from ._hooks import HookCaller
 from ._hooks import HookImpl
@@ -631,6 +632,42 @@ class PluginManager:
         if not plugins_to_remove:
             return orig
         return _SubsetHookCaller(orig, plugins_to_remove)
+
+    def subset_hook_relay(self, plugin_names: Iterable[str]) -> HookRelay:
+        """Return a read-only hook relay containing selected plugins.
+
+        Plugin names are resolved against the plugins registered when the
+        relay is created. Unknown or blocked names raise :class:`KeyError`.
+        Subsequent registration, unregistration, or blocking does not change
+        the selected plugin objects.
+
+        Each hook keeps the implementation and wrapper order of the manager,
+        but only implementations belonging to selected plugins participate.
+        Historic calls made through the returned relay are replayed only to
+        those selected plugins.
+        """
+        names = list(plugin_names)
+        unknown_names = [name for name in names if name not in self._name2plugin]
+        if unknown_names:
+            raise KeyError(f"Unknown plugin names: {unknown_names}")
+
+        blocked_names = [
+            name for name in names if self._name2plugin[name] is None
+        ]
+        if blocked_names:
+            raise KeyError(f"Blocked plugin names: {blocked_names}")
+
+        selected_plugins = frozenset(
+            self._name2plugin[name] for name in names
+        )
+        relay = HookRelay()
+        for hook_name, hook_caller in self.hook.__dict__.items():
+            setattr(
+                relay,
+                hook_name,
+                _SelectedHookCaller(hook_caller, selected_plugins),
+            )
+        return relay
 
 
 def _formatdef(func: Callable[..., object]) -> str:
