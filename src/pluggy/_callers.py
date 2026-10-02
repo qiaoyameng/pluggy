@@ -7,6 +7,9 @@ Prefer importing from :mod:`pluggy._execution`.
 
 from __future__ import annotations
 
+from ._execution import AsyncTeardown
+from ._execution import _async_multicall
+from ._execution import _AsyncOldStyleHookWrapper
 from ._execution import _multicall
 from ._execution import _raise_wrapfail
 from ._execution import _warn_teardown_exception
@@ -15,7 +18,10 @@ from ._execution import Teardown
 
 
 __all__ = [
+    "AsyncTeardown",
     "Teardown",
+    "_AsyncOldStyleHookWrapper",
+    "_async_multicall",
     "_multicall",
     "_raise_wrapfail",
     "_warn_teardown_exception",

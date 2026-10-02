@@ -14,6 +14,7 @@ from typing import TypeAlias
 import warnings
 
 from . import _tracing
+from ._callers import _async_multicall
 from ._callers import _multicall
 from ._compat import DistFacade
 from ._hooks import _HookImplFunction
@@ -37,7 +38,6 @@ _BeforeTrace: TypeAlias = Callable[[str, Sequence[HookImpl], Mapping[str, Any]],
 _AfterTrace: TypeAlias = Callable[
     [Result[Any], str, Sequence[HookImpl], Mapping[str, Any]], None
 ]
-
 
 def _warn_for_function(warning: Warning, function: Callable[..., object]) -> None:
     func = cast(types.FunctionType, function)
@@ -170,6 +170,7 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        self._inner_hookaexec = _async_multicall
 
     def _hookexec(
         self,
@@ -181,6 +182,17 @@ class PluginManager:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+
+    async def _hookaexec(
+        self,
+        hook_name: str,
+        methods: Sequence[HookImpl],
+        kwargs: Mapping[str, object],
+        firstresult: bool,
+    ) -> object | list[object]:
+        # Asynchronous counterpart of _hookexec, called from
+        # HookCaller.acall/acall_extra.
+        return await self._inner_hookaexec(hook_name, methods, kwargs, firstresult)
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.
@@ -241,7 +253,9 @@ class PluginManager:
         for hook_name, hookimpl, verified in hookimpls:
             hook = getattr(self.hook, hook_name, None)
             if hook is None:
-                hook = HookCaller(hook_name, self._hookexec)
+                hook = HookCaller(
+                    hook_name, self._hookexec, hook_aexecute=self._hookaexec
+                )
                 setattr(self.hook, hook_name, hook)
             elif not verified and hook.has_spec():
                 # An earlier impl's historic replay added this spec after the
@@ -338,7 +352,13 @@ class PluginManager:
             if spec_opts is not None:
                 hc: HookCaller | None = getattr(self.hook, name, None)
                 if hc is None:
-                    hc = HookCaller(name, self._hookexec, module_or_class, spec_opts)
+                    hc = HookCaller(
+                        name,
+                        self._hookexec,
+                        self._hookaexec,
+                        module_or_class,
+                        spec_opts,
+                    )
                     setattr(self.hook, name, hc)
                 else:
                     # Plugins registered this hook without knowing the spec.
@@ -420,8 +440,28 @@ class PluginManager:
                 f"Plugin {hookimpl.plugin_name!r}\nhook {hook.name!r}\n"
                 "historic incompatible with yield/wrapper/hookwrapper",
             )
+        if hook.is_historic() and (
+            hookimpl.async_function or hookimpl.async_generator_function
+        ):
+            raise PluginValidationError(
+                hookimpl.plugin,
+                f"Plugin {hookimpl.plugin_name!r}\nhook {hook.name!r}\n"
+                "historic hooks are incompatible with async implementations",
+            )
 
         assert hook.spec is not None
+        spec_is_async = bool(hook.spec.opts.get("async_"))
+        if (
+            hookimpl.async_function or hookimpl.async_generator_function
+        ) and not spec_is_async:
+            raise PluginValidationError(
+                hookimpl.plugin,
+                f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
+                f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
+                "Hookimpl is a coroutine/asynchronous-generator but the "
+                "hookspec is not declared with async_=True",
+            )
+
         if hook.spec.warn_on_impl:
             _warn_for_function(hook.spec.warn_on_impl, hookimpl.function)
 
@@ -447,13 +487,18 @@ class PluginManager:
         if (
             hookimpl.wrapper or hookimpl.hookwrapper
         ) and not inspect.isgeneratorfunction(hookimpl.function):
-            raise PluginValidationError(
-                hookimpl.plugin,
-                f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
-                f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
-                "Declared as wrapper=True or hookwrapper=True "
-                "but function is not a generator function",
-            )
+            if not (
+                spec_is_async
+                and inspect.isasyncgenfunction(hookimpl.function)
+            ):
+                raise PluginValidationError(
+                    hookimpl.plugin,
+                    f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
+                    f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
+                    "Declared as wrapper=True or hookwrapper=True "
+                    "but function is not a generator function (or an "
+                    "asynchronous generator function for an async hook)",
+                )
 
         if hookimpl.wrapper and hookimpl.hookwrapper:
             raise PluginValidationError(
@@ -568,6 +613,7 @@ class PluginManager:
         which represents the result of the overall hook call.
         """
         oldcall = self._inner_hookexec
+        oldacall = self._inner_hookaexec
 
         def traced_hookexec(
             hook_name: str,
@@ -582,10 +628,38 @@ class PluginManager:
             after(outcome, hook_name, hook_impls, caller_kwargs)
             return outcome.get_result()
 
+        async def traced_hookaexec(
+            hook_name: str,
+            hook_impls: Sequence[HookImpl],
+            caller_kwargs: Mapping[str, object],
+            firstresult: bool,
+        ) -> object | list[object]:
+            before(hook_name, hook_impls, caller_kwargs)
+            outcome_result: object
+            outcome_exception: BaseException | None = None
+            try:
+                outcome_result = await oldacall(
+                    hook_name, hook_impls, caller_kwargs, firstresult
+                )
+            except BaseException as exc:
+                outcome_exception = exc
+                outcome_result = None
+            after(
+                Result(outcome_result, outcome_exception),
+                hook_name,
+                hook_impls,
+                caller_kwargs,
+            )
+            if outcome_exception is not None:
+                raise outcome_exception
+            return outcome_result
+
         self._inner_hookexec = traced_hookexec
+        self._inner_hookaexec = traced_hookaexec
 
         def undo() -> None:
             self._inner_hookexec = oldcall
+            self._inner_hookaexec = oldacall
 
         return undo
 

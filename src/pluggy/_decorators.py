@@ -45,6 +45,7 @@ class HookspecMarker:
         self,
         function: _F,
         firstresult: bool = False,
+        async_: bool = False,
         historic: bool = False,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
@@ -55,6 +56,7 @@ class HookspecMarker:
         self,
         function: None = ...,
         firstresult: bool = ...,
+        async_: bool = ...,
         historic: bool = ...,
         warn_on_impl: Warning | None = ...,
         warn_on_impl_args: Mapping[str, Warning] | None = ...,
@@ -64,6 +66,7 @@ class HookspecMarker:
         self,
         function: _F | None = None,
         firstresult: bool = False,
+        async_: bool = False,
         historic: bool = False,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
@@ -78,6 +81,12 @@ class HookspecMarker:
             If ``True``, the 1:N hook call (N being the number of registered
             hook implementation functions) will stop at I<=N when the I'th
             function returns a non-``None`` result. See :ref:`firstresult`.
+
+        :param async_:
+            If ``True``, the hook is an :ref:`asynchronous hook <async>`:
+            it is awaited via :meth:`~pluggy.HookCaller.acall` and its
+            implementations may be coroutines or asynchronous generators.
+            Calling such a hook synchronously (``__call__``) is an error.
 
         :param historic:
             If ``True``, every call to the hook will be memorized and replayed
@@ -98,8 +107,11 @@ class HookspecMarker:
         def setattr_hookspec_opts(func: _F) -> _F:
             if historic and firstresult:
                 raise ValueError("cannot have a historic firstresult hook")
+            if historic and async_:
+                raise ValueError("cannot have a historic async hook")
             opts: HookspecOpts = {
                 "firstresult": firstresult,
+                "async_": async_,
                 "historic": historic,
                 "warn_on_impl": warn_on_impl,
                 "warn_on_impl_args": warn_on_impl_args,
@@ -132,6 +144,7 @@ class HookimplMarker:
         self,
         function: _F,
         hookwrapper: bool = ...,
+        async_: bool = ...,
         optionalhook: bool = ...,
         tryfirst: bool = ...,
         trylast: bool = ...,
@@ -144,6 +157,7 @@ class HookimplMarker:
         self,
         function: None = ...,
         hookwrapper: bool = ...,
+        async_: bool = ...,
         optionalhook: bool = ...,
         tryfirst: bool = ...,
         trylast: bool = ...,
@@ -155,6 +169,7 @@ class HookimplMarker:
         self,
         function: _F | None = None,
         hookwrapper: bool = False,
+        async_: bool = False,
         optionalhook: bool = False,
         tryfirst: bool = False,
         trylast: bool = False,
@@ -203,6 +218,11 @@ class HookimplMarker:
             (including earlier hook wrapper calls). This option is mutually
             exclusive with ``wrapper``. See :ref:`old_style_hookwrapper`.
 
+        :param async_:
+            If ``True``, mark a coroutine (``async def``) implementation of an
+            :ref:`asynchronous hook <async>`. Normally this is not necessary:
+            implementations of asynchronous hooks are detected automatically.
+
         :param specname:
             If provided, the given name will be used instead of the function
             name when matching this hook implementation to a hook specification
@@ -216,6 +236,7 @@ class HookimplMarker:
             opts: HookimplOpts = {
                 "wrapper": wrapper,
                 "hookwrapper": hookwrapper,
+                "async_": async_,
                 "optionalhook": optionalhook,
                 "tryfirst": tryfirst,
                 "trylast": trylast,

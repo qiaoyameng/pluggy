@@ -687,7 +687,88 @@ Note that all hook wrappers are still invoked with the first result.
 
 Also see the :ref:`pytest:firstresult` section in the ``pytest`` docs.
 
+.. _async:
+
+Asynchronous hooks
+^^^^^^^^^^^^^^^^^^
+
+An application that already runs an event loop can ``await`` hook calls
+directly instead of having each plugin manage its own event loop. A hook is
+declared asynchronous by passing ``async_=True`` to the
+:class:`~pluggy.HookspecMarker`:
+
+.. code-block:: python
+
+    @hookspec(async_=True)
+    async def fetch_data(self, url):
+        ...
+
+An asynchronous hook is called and awaited with
+:py:meth:`~pluggy.HookCaller.acall` (and
+:py:meth:`~pluggy.HookCaller.acall_extra`):
+
+.. code-block:: python
+
+    results = await pm.hook.fetch_data.acall(url="https://example.com")
+
+Both coroutine (``async def``) and regular synchronous implementations may
+participate in the same hook. They are executed **serially**, one after
+another, in the usual :ref:`call order <callorder>`, so an implementation is
+only started once the previous one finished. The :ref:`firstresult
+<firstresult>` option behaves exactly as for synchronous hooks. pluggy never
+runs ``asyncio.run`` itself -- the application owns the running loop.
+
+Calling an asynchronous hook through the synchronous entry point raises
+:class:`pluggy.HookCallError`, rather than silently returning a coroutine that
+nobody awaits:
+
+.. code-block:: python
+
+    pm.hook.fetch_data(url=...)  # HookCallError: use 'acall(...)' instead
+
+Asynchronous wrappers
+"""""""""""""""""""""
+
+New-style wrappers (``wrapper=True``) are written as asynchronous generators
+with a single ``yield``. The code before the ``yield`` runs before the inner
+implementations; the code after it runs afterwards. Note that, because Python
+forbids ``return value`` inside an asynchronous generator, the result of the
+inner call is passed through unchanged -- only an exception raised in the
+post-yield block changes the outcome:
+
+.. code-block:: python
+
+    @hookimpl(wrapper=True)
+    async def fetch_data(self, url):
+        print("before")
+        try:
+            yield
+        finally:
+            print("after")
+
+To *inspect or replace* the result or exception, use an old-style
+asynchronous wrapper (``hookwrapper=True``), which receives a
+:class:`~pluggy.Result` exactly like its synchronous counterpart:
+
+.. code-block:: python
+
+    @hookimpl(hookwrapper=True)
+    async def fetch_data(self, url):
+        outcome = yield
+        try:
+            outcome.get_result()
+        except Exception:
+            outcome.force_result(fallback_value)
+
+Synchronous wrappers (plain generators) may be mixed freely with
+asynchronous wrappers in the same asynchronous call. When a call is cancelled,
+every wrapper that was already entered runs its post-yield (``finally``)
+block before the cancelled call completes.
+
+Asynchronous hooks are incompatible with :ref:`historic <historic>` hooks.
+
 .. _historic:
+
 
 Historic hooks
 ^^^^^^^^^^^^^^

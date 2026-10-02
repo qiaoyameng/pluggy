@@ -1,0 +1,11 @@
+Added support for :ref:`asynchronous hooks <async>`.
+A hook specification is declared asynchronous with ``async_=True`` and awaited
+with ``await pm.hook.name.acall(...)`` (or ``acall_extra``).
+Coroutine (``async def``) implementations and regular synchronous
+implementations both take part and run serially in the usual call order, with
+``firstresult`` semantics unchanged.
+Asynchronous wrappers are supported in both the new (``wrapper=True``) and
+old (``hookwrapper=True``) styles, alongside synchronous wrappers; exceptions,
+cancellation and result replacement propagate in nested order.
+Calling an asynchronous hook through the synchronous entry point now raises
+:class:`pluggy.HookCallError` instead of returning an un-awaited coroutine.

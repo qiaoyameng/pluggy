@@ -4,8 +4,11 @@ Hook implementation representation.
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Generator
+import inspect
 from typing import Final
 from typing import final
 from typing import TypeAlias
@@ -19,7 +22,13 @@ from ._result import Result
 _T = TypeVar("_T")
 
 _Plugin: TypeAlias = object
-_HookImplFunction: TypeAlias = Callable[..., _T | Generator[None, Result[_T], None]]
+_HookImplFunction: TypeAlias = Callable[
+    ...,
+    _T
+    | Generator[None, Result[_T], None]
+    | Awaitable[_T]
+    | AsyncGenerator[None, _T],
+]
 
 
 @final
@@ -28,6 +37,8 @@ class HookImpl:
 
     __slots__ = (
         "argnames",
+        "async_function",
+        "async_generator_function",
         "function",
         "hookwrapper",
         "kwargnames",
@@ -50,6 +61,13 @@ class HookImpl:
         """:meta private:"""
         #: The hook implementation function.
         self.function: Final = function
+        #: Whether the implementation function is a coroutine function
+        #: (``async def``): its call result must be awaited. Asynchronous
+        #: generator functions are *not* included (they are wrappers).
+        self.async_function: Final = inspect.iscoroutinefunction(function)
+        #: Whether the implementation function is an asynchronous generator
+        #: function, i.e. an asynchronous wrapper.
+        self.async_generator_function: Final = inspect.isasyncgenfunction(function)
         argnames, kwargnames = varnames(self.function)
         #: The positional parameter names of ``function``.
         self.argnames: Final = argnames

@@ -4,6 +4,7 @@ Hook callers and relay.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -21,11 +22,16 @@ from ._decorators import _Namespace
 from ._decorators import HookSpec
 from ._impl import _Plugin
 from ._impl import HookImpl
+from ._result import HookCallError
 
 
 _HookExec: TypeAlias = Callable[
     [str, Sequence[HookImpl], Mapping[str, object], bool],
     object | list[object],
+]
+_AsyncHookExec: TypeAlias = Callable[
+    [str, Sequence[HookImpl], Mapping[str, object], bool],
+    Awaitable[object | list[object]],
 ]
 
 
@@ -58,6 +64,7 @@ class HookCaller:
 
     __slots__ = (
         "_call_history",
+        "_hookaexec",
         "_hookexec",
         "_hookimpls",
         "name",
@@ -68,6 +75,7 @@ class HookCaller:
         self,
         name: str,
         hook_execute: _HookExec,
+        hook_aexecute: _AsyncHookExec | None = None,
         specmodule_or_class: _Namespace | None = None,
         spec_opts: HookspecOpts | None = None,
     ) -> None:
@@ -75,6 +83,7 @@ class HookCaller:
         #: Name of the hook getting called.
         self.name: Final = name
         self._hookexec: Final = hook_execute
+        self._hookaexec: Final = hook_aexecute
         # The hookimpls list. The caller iterates it *in reverse*. Format:
         # 1. trylast nonwrappers
         # 2. nonwrappers
@@ -93,6 +102,21 @@ class HookCaller:
     # TODO: Document, or make private.
     def has_spec(self) -> bool:
         return self.spec is not None
+
+    def is_async(self) -> bool:
+        """Whether the hook is :ref:`asynchronous <async>` and must be
+        awaited with :meth:`acall`.
+
+        A hook is asynchronous if its specification declares ``async_=True``,
+        or if any of its registered implementations is a coroutine or an
+        asynchronous generator.
+        """
+        if self.spec is not None and self.spec.opts.get("async_"):
+            return True
+        return any(
+            impl.async_function or impl.async_generator_function
+            for impl in self._hookimpls
+        )
 
     # TODO: Document, or make private.
     def set_specification(
@@ -190,11 +214,42 @@ class HookCaller:
         assert not self.is_historic(), (
             "Cannot directly call a historic hook - use call_historic instead."
         )
+        if self.is_async():
+            raise HookCallError(
+                f"hook {self.name!r} is asynchronous, use "
+                f"'await <pm>.hook.{self.name}.acall(...)' instead"
+            )
         call_kwargs = self._apply_defaults(kwargs)
         self._verify_all_args_are_provided(call_kwargs)
         firstresult = self.spec.opts.get("firstresult", False) if self.spec else False
         # Copy because plugins may register other plugins during iteration (#438).
         return self._hookexec(
+            self.name, self._hookimpls.copy(), call_kwargs, firstresult
+        )
+
+    async def acall(self, **kwargs: object) -> Any:
+        """Await the hook.
+
+        Asynchronous counterpart of :meth:`__call__` (``hook.name(...)``).
+
+        Only accepts keyword arguments, which should match the hook
+        specification.
+
+        Registered implementations are executed serially, in the same order as
+        for a synchronous call. Both synchronous and coroutine implementations
+        take part, as do synchronous and asynchronous wrappers. Returns the
+        result(s) of calling all registered plugins, see :ref:`calling` and
+        :ref:`async`.
+        """
+        assert not self.is_historic(), (
+            "Cannot directly call a historic hook - use call_historic instead."
+        )
+        call_kwargs = self._apply_defaults(kwargs)
+        self._verify_all_args_are_provided(call_kwargs)
+        firstresult = self.spec.opts.get("firstresult", False) if self.spec else False
+        assert self._hookaexec is not None
+        # Copy because plugins may register other plugins during iteration (#438).
+        return await self._hookaexec(
             self.name, self._hookimpls.copy(), call_kwargs, firstresult
         )
 
@@ -240,6 +295,7 @@ class HookCaller:
         opts: HookimplOpts = {
             "wrapper": False,
             "hookwrapper": False,
+            "async_": False,
             "optionalhook": False,
             "trylast": False,
             "tryfirst": False,
@@ -260,6 +316,42 @@ class HookCaller:
             hookimpls.insert(i + 1, hookimpl)
         firstresult = self.spec.opts.get("firstresult", False) if self.spec else False
         return self._hookexec(self.name, hookimpls, kwargs, firstresult)
+
+    async def acall_extra(
+        self, methods: Sequence[Callable[..., object]], kwargs: Mapping[str, object]
+    ) -> Any:
+        """Asynchronous counterpart of :meth:`call_extra`, see
+        :ref:`call_extra` and :ref:`async`."""
+        assert not self.is_historic(), (
+            "Cannot directly call a historic hook - use call_historic instead."
+        )
+        kwargs = self._apply_defaults(kwargs)
+        self._verify_all_args_are_provided(kwargs)
+        opts: HookimplOpts = {
+            "wrapper": False,
+            "hookwrapper": False,
+            "async_": False,
+            "optionalhook": False,
+            "trylast": False,
+            "tryfirst": False,
+            "specname": None,
+        }
+        hookimpls = self._hookimpls.copy()
+        for method in methods:
+            hookimpl = HookImpl(None, "<temp>", method, opts)
+            # Find last non-tryfirst nonwrapper method.
+            i = len(hookimpls) - 1
+            while i >= 0 and (
+                # Skip wrappers.
+                (hookimpls[i].hookwrapper or hookimpls[i].wrapper)
+                # Skip tryfirst nonwrappers.
+                or hookimpls[i].tryfirst
+            ):
+                i -= 1
+            hookimpls.insert(i + 1, hookimpl)
+        firstresult = self.spec.opts.get("firstresult", False) if self.spec else False
+        assert self._hookaexec is not None
+        return await self._hookaexec(self.name, hookimpls, kwargs, firstresult)
 
     def _maybe_apply_history(self, method: HookImpl) -> None:
         """Apply call history to a new hookimpl if it is marked as historic."""
@@ -301,6 +393,7 @@ class _SubsetHookCaller(HookCaller):
         self._remove_plugins = remove_plugins
         self.name = orig.name  # type: ignore[misc]
         self._hookexec = orig._hookexec  # type: ignore[misc]
+        self._hookaexec = orig._hookaexec  # type: ignore[misc]
 
     @property  # type: ignore[misc]
     def _hookimpls(self) -> list[HookImpl]:

@@ -13,6 +13,8 @@ class HookspecOpts(TypedDict):
 
     #: Whether the hook is :ref:`first result only <firstresult>`.
     firstresult: bool
+    #: Whether the hook is :ref:`asynchronous <async>`.
+    async_: bool
     #: Whether the hook is :ref:`historic <historic>`.
     historic: bool
     #: Whether the hook :ref:`warns when implemented <warn_on_impl>`.
@@ -32,6 +34,9 @@ class HookimplOpts(TypedDict):
     #: Whether the hook implementation is an :ref:`old-style wrapper
     #: <old_style_hookwrappers>`.
     hookwrapper: bool
+    #: Whether the hook implementation is a coroutine (``async def``)
+    #: implementation, see :ref:`async`.
+    async_: bool
     #: Whether validation against a hook specification is :ref:`optional
     #: <optionalhook>`.
     optionalhook: bool
@@ -50,5 +55,6 @@ def normalize_hookimpl_opts(opts: HookimplOpts) -> None:
     opts.setdefault("trylast", False)
     opts.setdefault("wrapper", False)
     opts.setdefault("hookwrapper", False)
+    opts.setdefault("async_", False)
     opts.setdefault("optionalhook", False)
     opts.setdefault("specname", None)
