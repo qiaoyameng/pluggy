@@ -1,0 +1,3 @@
+Added ``PluginManager.check_hookspec_compatibility()`` to check installed
+plugins against candidate hookspec declarations without modifying the
+manager or calling hook implementations.

@@ -132,10 +132,17 @@ class PluginValidationError(Exception):
     :param message: Error message.
     """
 
-    def __init__(self, plugin: _Plugin, message: str) -> None:
+    def __init__(
+        self,
+        plugin: _Plugin,
+        message: str,
+        hook_name: str | None = None,
+    ) -> None:
         super().__init__(message)
         #: The plugin which failed validation.
         self.plugin = plugin
+        #: The hook which failed validation, if known.
+        self.hook_name = hook_name
 
 
 class PluginManager:
@@ -378,6 +385,75 @@ class PluginManager:
             _get_marker_opts(found[0], self.project_name + "_spec"),
         )
 
+    def check_hookspec_compatibility(
+        self, module_or_class: _Namespace
+    ) -> list[PluginValidationError]:
+        """Check installed plugins against candidate hook specifications.
+
+        This method is read-only: it never registers the candidate
+        specifications, registers or unregisters plugins, replays historic
+        calls, or calls hook implementations.
+
+        :returns:
+            A validation error for every plugin and hook which would fail if
+            the candidate specifications were registered.
+        """
+        candidate_specs: list[tuple[str, HookspecOpts]] = []
+        for name in dir(module_or_class):
+            spec_opts = self.parse_hookspec_opts(module_or_class, name)
+            if spec_opts is not None:
+                candidate_specs.append((name, spec_opts))
+        if not candidate_specs:
+            raise ValueError(
+                f"did not find any {self.project_name!r} hooks in {module_or_class!r}"
+            )
+
+        conflicts: list[PluginValidationError] = []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for name, spec_opts in candidate_specs:
+                candidate_hook = HookCaller(
+                    name, self._hookexec, module_or_class, spec_opts
+                )
+                assert candidate_hook.spec is not None
+                current_hook = getattr(self.hook, name, None)
+                if current_hook is None:
+                    continue
+
+                current_firstresult = (
+                    current_hook.spec.opts.get("firstresult", False)
+                    if current_hook.spec is not None
+                    else False
+                )
+                candidate_firstresult = candidate_hook.spec.opts.get(
+                    "firstresult", False
+                )
+
+                for hookimpl in current_hook.get_hookimpls():
+                    try:
+                        self._verify_hook(candidate_hook, hookimpl)
+                    except PluginValidationError as err:
+                        conflicts.append(err)
+
+                    if (
+                        current_firstresult != candidate_firstresult
+                        and (hookimpl.wrapper or hookimpl.hookwrapper)
+                    ):
+                        conflicts.append(
+                            PluginValidationError(
+                                hookimpl.plugin,
+                                f"Plugin {hookimpl.plugin_name!r} for hook {name!r}\n"
+                                "hookimpl definition: "
+                                f"{_formatdef(hookimpl.function)}\n"
+                                f"firstresult changes from {current_firstresult!r} "
+                                f"to {candidate_firstresult!r}, which changes the "
+                                "result protocol received by wrappers",
+                                hook_name=name,
+                            )
+                        )
+
+        return conflicts
+
     def get_plugins(self) -> set[Any]:
         """Return a set of all registered plugin objects."""
         return {x for x in self._name2plugin.values() if x is not None}
@@ -419,6 +495,7 @@ class PluginManager:
                 hookimpl.plugin,
                 f"Plugin {hookimpl.plugin_name!r}\nhook {hook.name!r}\n"
                 "historic incompatible with yield/wrapper/hookwrapper",
+                hook_name=hook.name,
             )
 
         assert hook.spec is not None
@@ -436,6 +513,7 @@ class PluginManager:
                 f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
                 f"Argument(s) {notinspec} are declared in the hookimpl but "
                 "can not be found in the hookspec",
+                hook_name=hook.name,
             )
 
         if hook.spec.warn_on_impl_args:
@@ -453,6 +531,7 @@ class PluginManager:
                 f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
                 "Declared as wrapper=True or hookwrapper=True "
                 "but function is not a generator function",
+                hook_name=hook.name,
             )
 
         if hookimpl.wrapper and hookimpl.hookwrapper:
@@ -461,6 +540,7 @@ class PluginManager:
                 f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
                 f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
                 "The wrapper=True and hookwrapper=True options are mutually exclusive",
+                hook_name=hook.name,
             )
 
     def check_pending(self) -> None:
@@ -474,10 +554,17 @@ class PluginManager:
             if not hook.has_spec():
                 for hookimpl in hook.get_hookimpls():
                     if not hookimpl.optionalhook:
-                        raise PluginValidationError(
-                            hookimpl.plugin,
-                            f"unknown hook {name!r} in plugin {hookimpl.plugin!r}",
-                        )
+                        raise self._unknown_hook_validation_error(name, hookimpl)
+
+    @staticmethod
+    def _unknown_hook_validation_error(
+        name: str, hookimpl: HookImpl
+    ) -> PluginValidationError:
+        return PluginValidationError(
+            hookimpl.plugin,
+            f"unknown hook {name!r} in plugin {hookimpl.plugin!r}",
+            hook_name=name,
+        )
 
     def load_setuptools_entrypoints(self, group: str, name: str | None = None) -> int:
         """Load modules from querying the specified setuptools ``group``.

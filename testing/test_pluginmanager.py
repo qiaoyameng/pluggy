@@ -1207,6 +1207,190 @@ def test_check_pending_nonspec_hook(
         pm.check_pending()
 
 
+def test_check_hookspec_compatibility_mixed_plugins(pm: PluginManager) -> None:
+    class CurrentSpecs:
+        @hookspec
+        def configure(self, config, option=None):
+            pass  # pragma: no cover
+
+    class CompatibleSpecs:
+        @hookspec
+        def configure(self, config, /, option, extra, extra_optional=None):
+            pass  # pragma: no cover
+
+    class IncompatibleSpecs:
+        @hookspec(firstresult=True)
+        def configure(self, config, replacement=None):
+            pass  # pragma: no cover
+
+    calls: list[tuple[object, object]] = []
+
+    class PlainPlugin:
+        @hookimpl
+        def configure(self, config, option=None):
+            calls.append((config, option))
+            return "plain"
+
+    class OptionalArgPlugin:
+        @hookimpl
+        def configure(self, config):
+            return "optional-arg"
+
+    class RequiredOptionalArgPlugin:
+        @hookimpl
+        def configure(self, config, option):
+            return "required-option"
+
+    class WrapperPlugin:
+        @hookimpl(wrapper=True)
+        def configure(self, config):
+            calls.append(("wrapper-entry", config))
+            outcome = yield
+            return ("wrapped", outcome)
+
+    pm.add_hookspecs(CurrentSpecs)
+    plain_plugin = PlainPlugin()
+    optional_arg_plugin = OptionalArgPlugin()
+    required_optional_arg_plugin = RequiredOptionalArgPlugin()
+    wrapper_plugin = WrapperPlugin()
+    pm.register(plain_plugin, name="plain")
+    pm.register(optional_arg_plugin, name="optional-arg")
+    pm.register(required_optional_arg_plugin, name="required-option")
+    pm.register(wrapper_plugin, name="wrapper")
+    current_spec = pm.hook.configure.spec
+    hook_names = set(pm.hook.__dict__)
+
+    assert pm.check_hookspec_compatibility(CompatibleSpecs) == []
+    assert calls == []
+    assert pm.hook.configure.spec is current_spec
+    assert set(pm.hook.__dict__) == hook_names
+
+    conflicts = pm.check_hookspec_compatibility(IncompatibleSpecs)
+    assert len(conflicts) == 2
+    assert {err.plugin for err in conflicts} == {
+        required_optional_arg_plugin,
+        wrapper_plugin,
+    }
+    assert {err.hook_name for err in conflicts} == {"configure"}
+    assert any("option" in str(err) for err in conflicts)
+    assert any("firstresult" in str(err) for err in conflicts)
+    assert calls == []
+    assert pm.hook.configure.spec is current_spec
+    assert set(pm.hook.__dict__) == hook_names
+    assert not pm.hook.configure.spec.opts["firstresult"]
+
+    result = pm.hook.configure(config="cfg", option="opt")
+    assert result == (
+        "wrapped",
+        ["required-option", "optional-arg", "plain"],
+    )
+    assert calls == [
+        ("wrapper-entry", "cfg"),
+        ("cfg", "opt"),
+    ]
+
+
+def test_check_hookspec_compatibility_historic_wrapper(pm: PluginManager) -> None:
+    class CurrentSpecs:
+        @hookspec
+        def configure(self, config):
+            pass  # pragma: no cover
+
+    class CandidateSpecs:
+        @hookspec(historic=True)
+        def configure(self, config):
+            pass  # pragma: no cover
+
+    class Plugin:
+        @hookimpl(hookwrapper=True)
+        def configure(self, config):
+            yield  # pragma: no cover
+
+    pm.add_hookspecs(CurrentSpecs)
+    plugin = Plugin()
+    pm.register(plugin)
+
+    conflicts = pm.check_hookspec_compatibility(CandidateSpecs)
+    assert len(conflicts) == 1
+    assert conflicts[0].plugin is plugin
+    assert conflicts[0].hook_name == "configure"
+    assert "historic incompatible" in str(conflicts[0])
+    assert not pm.hook.configure.is_historic()
+
+
+def test_check_hookspec_compatibility_required_arg_becomes_optional(
+    pm: PluginManager,
+) -> None:
+    class CurrentSpecs:
+        @hookspec
+        def configure(self, config):
+            pass  # pragma: no cover
+
+    class CandidateSpecs:
+        @hookspec
+        def configure(self, config=None):
+            pass  # pragma: no cover
+
+    class Plugin:
+        @hookimpl
+        def configure(self, config):
+            return config
+
+    pm.add_hookspecs(CurrentSpecs)
+    pm.register(Plugin())
+
+    assert pm.check_hookspec_compatibility(CandidateSpecs) == []
+
+
+@pytest.mark.parametrize(
+    ("current_firstresult", "candidate_firstresult"),
+    [(False, True), (True, False)],
+)
+@pytest.mark.parametrize(
+    ("marker_kwargs",),
+    [({"wrapper": True},), ({"hookwrapper": True},)],
+)
+def test_check_hookspec_compatibility_firstresult_wrapper(
+    pm: PluginManager,
+    current_firstresult: bool,
+    candidate_firstresult: bool,
+    marker_kwargs: dict[str, bool],
+) -> None:
+    class CurrentSpecs:
+        @hookspec(firstresult=current_firstresult)
+        def configure(self):
+            pass  # pragma: no cover
+
+    class CandidateSpecs:
+        @hookspec(firstresult=candidate_firstresult)
+        def configure(self):
+            pass  # pragma: no cover
+
+    class Plugin:
+        @hookimpl(**marker_kwargs)
+        def configure(self):
+            yield  # pragma: no cover
+
+    pm.add_hookspecs(CurrentSpecs)
+    plugin = Plugin()
+    pm.register(plugin)
+
+    conflicts = pm.check_hookspec_compatibility(CandidateSpecs)
+    assert len(conflicts) == 1
+    assert conflicts[0].plugin is plugin
+    assert conflicts[0].hook_name == "configure"
+    assert "firstresult changes" in str(conflicts[0])
+    assert pm.hook.configure.spec.opts["firstresult"] is current_firstresult
+
+
+def test_check_hookspec_compatibility_without_specs(pm: PluginManager) -> None:
+    class CandidateSpecs:
+        pass
+
+    with pytest.raises(ValueError, match="did not find any"):
+        pm.check_hookspec_compatibility(CandidateSpecs)
+
+
 def test_unregister_plugin_with_multi_hookimpls(pm: PluginManager) -> None:
     """Verify that unregistering a plugin with multiple hookimpls on the
     same hook (via specname) removes all of them (#431)."""

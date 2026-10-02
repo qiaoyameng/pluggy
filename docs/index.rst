@@ -666,6 +666,24 @@ callers:
 .. versionadded:: 1.7
     Hookspec argument defaults.
 
+Checking candidate hookspecs
++++++++++++++++++++++++++++
+Before changing existing hookspecs, a host can check whether the installed
+plugins would still pass validation against a candidate module or class:
+
+.. code-block:: python
+
+    conflicts = pm.check_hookspec_compatibility(candidate_specs)
+    for error in conflicts:
+        print(error.plugin, error.hook_name, error)
+
+The check is read-only. It does not register the candidate hookspecs, change
+the installed plugins, replay historic calls, or call hook implementations.
+An empty list means that all currently installed implementations are
+compatible with the candidate declarations. A change to ``firstresult`` is
+also reported for wrappers because it changes the result protocol exposed at
+their ``yield`` point.
+
 .. _firstresult:
 
 First result only
