@@ -15,6 +15,7 @@ import warnings
 
 from . import _tracing
 from ._callers import _multicall
+from ._callers import _amulticall
 from ._compat import DistFacade
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
@@ -170,6 +171,7 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        self._inner_ahookexec = _amulticall
 
     def _hookexec(
         self,
@@ -181,6 +183,16 @@ class PluginManager:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+
+    def _ahookexec(
+        self,
+        hook_name: str,
+        methods: Sequence[HookImpl],
+        kwargs: Mapping[str, object],
+        firstresult: bool,
+    ) -> object | list[object]:
+        # called from all hookcaller instances.
+        return self._inner_ahookexec(hook_name, methods, kwargs, firstresult)
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.
@@ -241,7 +253,7 @@ class PluginManager:
         for hook_name, hookimpl, verified in hookimpls:
             hook = getattr(self.hook, hook_name, None)
             if hook is None:
-                hook = HookCaller(hook_name, self._hookexec)
+                hook = HookCaller(hook_name, self._hookexec, self._ahookexec)
                 setattr(self.hook, hook_name, hook)
             elif not verified and hook.has_spec():
                 # An earlier impl's historic replay added this spec after the
@@ -338,7 +350,7 @@ class PluginManager:
             if spec_opts is not None:
                 hc: HookCaller | None = getattr(self.hook, name, None)
                 if hc is None:
-                    hc = HookCaller(name, self._hookexec, module_or_class, spec_opts)
+                    hc = HookCaller(name, self._hookexec, self._ahookexec, module_or_class, spec_opts)
                     setattr(self.hook, name, hc)
                 else:
                     # Plugins registered this hook without knowing the spec.
@@ -444,16 +456,37 @@ class PluginManager:
                 if argname_warning is not None:
                     _warn_for_function(argname_warning, hookimpl.function)
 
-        if (
-            hookimpl.wrapper or hookimpl.hookwrapper
-        ) and not inspect.isgeneratorfunction(hookimpl.function):
-            raise PluginValidationError(
-                hookimpl.plugin,
-                f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
-                f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
-                "Declared as wrapper=True or hookwrapper=True "
-                "but function is not a generator function",
-            )
+        if hookimpl.wrapper or hookimpl.hookwrapper:
+            if hookimpl.hookwrapper and hookimpl.isasyncgenfunction:
+                raise PluginValidationError(
+                    hookimpl.plugin,
+                    f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
+                    f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
+                    "The hookwrapper=True option does not support async "
+                    "generators; use wrapper=True with a synchronous "
+                    "generator instead",
+                )
+            elif hookimpl.hookwrapper and not inspect.isgeneratorfunction(
+                hookimpl.function
+            ):
+                raise PluginValidationError(
+                    hookimpl.plugin,
+                    f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
+                    f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
+                    "Declared as hookwrapper=True but function is not a "
+                    "generator function",
+                )
+            elif hookimpl.wrapper and not (
+                inspect.isgeneratorfunction(hookimpl.function)
+                or hookimpl.isasyncgenfunction
+            ):
+                raise PluginValidationError(
+                    hookimpl.plugin,
+                    f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
+                    f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
+                    "Declared as wrapper=True but function is not a generator "
+                    "or async generator function",
+                )
 
         if hookimpl.wrapper and hookimpl.hookwrapper:
             raise PluginValidationError(

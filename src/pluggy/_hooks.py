@@ -8,6 +8,7 @@ backward compatibility.
 from __future__ import annotations
 
 from ._caller import _HookCaller
+from ._caller import _AsyncHookExec
 from ._caller import _HookExec
 from ._caller import _HookRelay
 from ._caller import _SubsetHookCaller
@@ -35,6 +36,7 @@ __all__ = [
     "HookimplOpts",
     "HookspecMarker",
     "HookspecOpts",
+    "_AsyncHookExec",
     "_HookCaller",
     "_HookExec",
     "_HookImplFunction",

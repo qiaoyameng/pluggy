@@ -23,6 +23,10 @@ class HookspecOpts(TypedDict):
     #: .. versionadded:: 1.5
     warn_on_impl_args: Mapping[str, Warning] | None
 
+    #: Whether the hook is :ref:`asynchronous <async>` and must be invoked
+    #: through :meth:`pluggy.HookCaller.acall`.
+    async_: bool
+
 
 class HookimplOpts(TypedDict):
     """Options for a hook implementation."""

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections.abc import Generator
+import inspect
 from typing import Final
 from typing import final
 from typing import TypeAlias
@@ -30,6 +31,8 @@ class HookImpl:
         "argnames",
         "function",
         "hookwrapper",
+        "isasyncgenfunction",
+        "iscoroutinefunction",
         "kwargnames",
         "optionalhook",
         "opts",
@@ -76,6 +79,15 @@ class HookImpl:
         #: Whether to try to order this hook implementation :ref:`last
         #: <callorder>`.
         self.trylast: Final = hook_impl_opts["trylast"]
+        #: Whether the hook implementation is a coroutine function
+        #: (``async def``). Coroutine implementations can only be invoked
+        #: through the asynchronous call entry point, see
+        #: :meth:`pluggy.HookCaller.acall`.
+        self.iscoroutinefunction: Final = inspect.iscoroutinefunction(function)
+        #: Whether the hook implementation is an async generator function
+        #: (``async def`` with ``yield``), used for asynchronous
+        #: :ref:`wrappers <hookwrapper>`.
+        self.isasyncgenfunction: Final = inspect.isasyncgenfunction(function)
 
     def __repr__(self) -> str:
         return f"<HookImpl plugin_name={self.plugin_name!r}, plugin={self.plugin!r}>"

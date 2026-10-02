@@ -48,6 +48,7 @@ class HookspecMarker:
         historic: bool = False,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
+        async_: bool = False,
     ) -> _F: ...
 
     @overload
@@ -58,6 +59,7 @@ class HookspecMarker:
         historic: bool = ...,
         warn_on_impl: Warning | None = ...,
         warn_on_impl_args: Mapping[str, Warning] | None = ...,
+        async_: bool = ...,
     ) -> Callable[[_F], _F]: ...
 
     def __call__(
@@ -67,6 +69,7 @@ class HookspecMarker:
         historic: bool = False,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
+        async_: bool = False,
     ) -> _F | Callable[[_F], _F]:
         """If passed a function, directly sets attributes on the function
         which will make it discoverable to :meth:`PluginManager.add_hookspecs`.
@@ -93,16 +96,26 @@ class HookspecMarker:
             See :ref:`warn_on_impl`.
 
             .. versionadded:: 1.5
+
+        :param async_:
+            If ``True``, the hook is declared asynchronous: it must be
+            invoked through :meth:`pluggy.HookCaller.acall`, which supports
+            coroutine and async generator implementations alongside plain
+            synchronous ones. Calling it synchronously raises
+            :exc:`pluggy.HookCallError`. See :ref:`async`.
         """
 
         def setattr_hookspec_opts(func: _F) -> _F:
             if historic and firstresult:
                 raise ValueError("cannot have a historic firstresult hook")
+            if historic and async_:
+                raise ValueError("cannot have a historic async hook")
             opts: HookspecOpts = {
                 "firstresult": firstresult,
                 "historic": historic,
                 "warn_on_impl": warn_on_impl,
                 "warn_on_impl_args": warn_on_impl_args,
+                "async_": async_,
             }
             setattr(func, self.project_name + "_spec", opts)
             return func

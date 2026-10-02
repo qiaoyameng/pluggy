@@ -5,6 +5,7 @@ Hook callers and relay.
 from __future__ import annotations
 
 from collections.abc import Callable
+from collections.abc import Coroutine
 from collections.abc import Mapping
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
@@ -19,13 +20,20 @@ from ._config import HookimplOpts
 from ._config import HookspecOpts
 from ._decorators import _Namespace
 from ._decorators import HookSpec
+from ._execution import _amulticall
 from ._impl import _Plugin
 from ._impl import HookImpl
+from ._result import HookCallError
 
 
 _HookExec: TypeAlias = Callable[
     [str, Sequence[HookImpl], Mapping[str, object], bool],
     object | list[object],
+]
+
+_AsyncHookExec: TypeAlias = Callable[
+    [str, Sequence[HookImpl], Mapping[str, object], bool],
+    "Coroutine[object, object, object | list[object]]",
 ]
 
 
@@ -57,6 +65,7 @@ class HookCaller:
     """A caller of all registered implementations of a hook specification."""
 
     __slots__ = (
+        "_ahookexec",
         "_call_history",
         "_hookexec",
         "_hookimpls",
@@ -68,6 +77,7 @@ class HookCaller:
         self,
         name: str,
         hook_execute: _HookExec,
+        async_hook_execute: _AsyncHookExec | None = None,
         specmodule_or_class: _Namespace | None = None,
         spec_opts: HookspecOpts | None = None,
     ) -> None:
@@ -75,6 +85,9 @@ class HookCaller:
         #: Name of the hook getting called.
         self.name: Final = name
         self._hookexec: Final = hook_execute
+        self._ahookexec: Final = (
+            async_hook_execute if async_hook_execute is not None else _amulticall
+        )
         # The hookimpls list. The caller iterates it *in reverse*. Format:
         # 1. trylast nonwrappers
         # 2. nonwrappers
@@ -186,6 +199,44 @@ class HookCaller:
 
         Returns the result(s) of calling all registered plugins, see
         :ref:`calling`.
+
+        Raises :exc:`HookCallError` if the hook is declared with
+        ``async_=True`` or if any registered implementation is a
+        coroutine or an async generator; use :meth:`acall` for those.
+        """
+        assert not self.is_historic(), (
+            "Cannot directly call a historic hook - use call_historic instead."
+        )
+        if self.spec is not None and self.spec.opts.get("async_", False):
+            raise HookCallError(
+                f"hook {self.name!r} is declared as async; "
+                "use `await hook.acall(...)` instead"
+            )
+        call_kwargs = self._apply_defaults(kwargs)
+        self._verify_all_args_are_provided(call_kwargs)
+        firstresult = self.spec.opts.get("firstresult", False) if self.spec else False
+        # Copy because plugins may register other plugins during iteration (#438).
+        return self._hookexec(
+            self.name, self._hookimpls.copy(), call_kwargs, firstresult
+        )
+
+    async def acall(self, **kwargs: object) -> Any:
+        """Call the hook asynchronously.
+
+        Like :meth:`__call__`, but supports both synchronous and
+        asynchronous (``async``/``await``) implementations: coroutine
+        functions are awaited and async generator (new-style ``yield``)
+        wrappers are fully supported. Synchronous implementations
+        participate unchanged.
+
+        This method is a :term:`coroutine` and must be awaited. The
+        library never calls :func:`asyncio.run` internally; the caller
+        is responsible for running the event loop.
+
+        Returns the result(s) of calling all registered plugins, see
+        :ref:`calling`.
+
+        .. versionadded:: 1.6
         """
         assert not self.is_historic(), (
             "Cannot directly call a historic hook - use call_historic instead."
@@ -194,7 +245,7 @@ class HookCaller:
         self._verify_all_args_are_provided(call_kwargs)
         firstresult = self.spec.opts.get("firstresult", False) if self.spec else False
         # Copy because plugins may register other plugins during iteration (#438).
-        return self._hookexec(
+        return await self._ahookexec(
             self.name, self._hookimpls.copy(), call_kwargs, firstresult
         )
 
@@ -301,6 +352,7 @@ class _SubsetHookCaller(HookCaller):
         self._remove_plugins = remove_plugins
         self.name = orig.name  # type: ignore[misc]
         self._hookexec = orig._hookexec  # type: ignore[misc]
+        self._ahookexec = orig._ahookexec  # type: ignore[misc]
 
     @property  # type: ignore[misc]
     def _hookimpls(self) -> list[HookImpl]:
