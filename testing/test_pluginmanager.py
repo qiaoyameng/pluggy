@@ -2,8 +2,11 @@
 ``PluginManager`` unit and public API testing.
 """
 
+from collections.abc import Callable
+import gc
 import importlib.metadata
 import types
+import weakref
 from typing import Any
 from typing import cast
 
@@ -538,6 +541,229 @@ def test_register_historic(pm: PluginManager) -> None:
     assert out == [1, 10]
     pm.hook.he_method1.call_historic(kwargs={"arg": 12})
     assert out == [1, 10, 120, 12]
+
+
+def test_bounded_historic_calls_reports_gap_and_releases_old_payloads(
+    pm: PluginManager,
+) -> None:
+    class Payload:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    class Hooks:
+        @hookspec(historic=True, history_size=3)
+        def he_method1(self, payload: Payload) -> int: ...
+
+    pm.add_hookspecs(Hooks)
+    he_method1 = pm.hook.he_method1
+
+    payloads: list[Payload] = []
+    payload_refs: list[weakref.ref[Payload]] = []
+    callbacks: list[Callable[[Any], None]] = []
+    callback_refs: list[weakref.ref[object]] = []
+    collectors: list[list[int]] = []
+    for value in range(1, 6):
+        payload = Payload(value)
+
+        collector: list[int] = []
+
+        def make_callback(collector: list[int]) -> Callable[[int], None]:
+            def callback(result: int) -> None:
+                collector.append(result)
+
+            return callback
+
+        callback = make_callback(collector)
+
+        collectors.append(collector)
+        payloads.append(payload)
+        payload_refs.append(weakref.ref(payload))
+        callbacks.append(callback)
+        callback_refs.append(weakref.ref(callback))
+        call_id = he_method1.call_historic(
+            result_callback=callback,
+            kwargs={"payload": payload},
+        )
+        assert call_id == value
+
+    history = he_method1.get_history()
+    assert he_method1.history_start_call_id == 3
+    assert [call.call_id for call in history] == [3, 4, 5]
+    assert he_method1.get_next_call_id() == 6
+    assert [call.kwargs["payload"].value for call in history] == [3, 4, 5]
+
+    results: list[int] = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, payload: Payload) -> int:
+            results.append(payload.value)
+            return payload.value * 10
+
+    pm.register(Plugin())
+    assert results == [3, 4, 5]
+    assert collectors[2:] == [[30], [40], [50]]
+
+    del payloads[:2], callbacks[:2]
+    gc.collect()
+    gc.collect()
+    assert payload_refs[0]() is None
+    assert payload_refs[1]() is None
+    assert callback_refs[0]() is None
+    assert callback_refs[1]() is None
+    assert [ref() is not None for ref in payload_refs[2:]] == [True, True, True]
+    assert [ref() is not None for ref in callback_refs[2:]] == [
+        True,
+        True,
+        True,
+    ]
+
+
+def test_clear_historic_calls(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    he_method1 = pm.hook.he_method1
+    callbacks: list[Callable[[int], None]] = []
+    callback_refs: list[weakref.ref[object]] = []
+    for value in range(1, 5):
+        def callback(result: int) -> None:
+            pass
+
+        callbacks.append(callback)
+        callback_refs.append(weakref.ref(callback))
+    call_ids = [
+        he_method1.call_historic(kwargs={"arg": value})
+        for value in range(1, 5)
+    ]
+    assert call_ids == [1, 2, 3, 4]
+
+    assert he_method1.clear_history(2) == 2
+    del callbacks[:2]
+    gc.collect()
+    gc.collect()
+    assert callback_refs[0]() is None
+    assert callback_refs[1]() is None
+    assert [call.call_id for call in he_method1.get_history()] == [3, 4]
+    assert he_method1.clear_history() == 2
+    assert he_method1.get_history() == []
+    assert he_method1.get_next_call_id() == 5
+    assert he_method1.history_start_call_id is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"historic": True, "history_size": -1}, "non-negative"),
+        ({"historic": True, "history_size": 1.5}, "integer"),
+        ({"historic": False, "history_size": 3}, "historic=True"),
+    ],
+)
+def test_invalid_history_size(
+    pm: PluginManager,
+    kwargs: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        class Hooks:
+            @hookspec(**kwargs)
+            def he_method1(self) -> None: ...
+
+
+def test_bounded_historic_replay_with_nested_call_and_registration(
+    pm: PluginManager,
+) -> None:
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def configure(self, value: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    pm.hook.configure.call_historic(kwargs={"value": 1})
+
+    class Plugin2:
+        def __init__(self) -> None:
+            self.values: list[int] = []
+            self.plugin3: Plugin3 | None = None
+
+        @hookimpl
+        def configure(self, value: int) -> None:
+            self.values.append(value)
+            if value == 1:
+                plugin3 = Plugin3()
+                self.plugin3 = plugin3
+                pm.register(plugin3)
+                pm.hook.configure.call_historic(kwargs={"value": 2})
+
+    class Plugin3:
+        def __init__(self) -> None:
+            self.values: list[int] = []
+            self.plugin4: Plugin4 | None = None
+
+        @hookimpl
+        def configure(self, value: int) -> None:
+            self.values.append(value)
+            if value == 1:
+                plugin4 = Plugin4()
+                self.plugin4 = plugin4
+                pm.register(plugin4)
+
+    class Plugin4:
+        def __init__(self) -> None:
+            self.values: list[int] = []
+
+        @hookimpl
+        def configure(self, value: int) -> None:
+            self.values.append(value)
+
+    plugin2 = Plugin2()
+    pm.register(plugin2)
+
+    assert plugin2.values == [1, 2]
+    plugin3 = plugin2.plugin3
+    assert plugin3 is not None
+    plugin4 = plugin3.plugin4
+    assert plugin4 is not None
+    assert plugin3.values == [1, 2]
+    assert plugin4.values == [1, 2]
+
+
+def test_zero_sized_history_replays_in_flight_call(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True, history_size=0)
+        def configure(self, value: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin2:
+        def __init__(self) -> None:
+            self.plugin: Plugin3 | None = None
+
+        @hookimpl
+        def configure(self, value: int) -> None:
+            if self.plugin is None:
+                self.plugin = Plugin3()
+                pm.register(self.plugin)
+
+    class Plugin3:
+        def __init__(self) -> None:
+            self.values: list[int] = []
+
+        @hookimpl
+        def configure(self, value: int) -> None:
+            self.values.append(value)
+
+    plugin2 = Plugin2()
+    pm.register(plugin2)
+    pm.hook.configure.call_historic(kwargs={"value": 1})
+
+    assert plugin2.plugin is not None
+    assert plugin2.plugin.values == [1]
+    assert pm.hook.configure.get_history() == []
+
+    pm.hook.configure.call_historic(kwargs={"value": 2})
+    assert plugin2.plugin.values == [1, 2]
 
 
 def test_historic_with_subset_hook_caller(pm: PluginManager) -> None:

@@ -248,8 +248,7 @@ class PluginManager:
                 # first pass. Failing here leaves the plugin partially
                 # registered, but only user code during replay can get here.
                 self._verify_hook(hook, hookimpl)
-            hook._maybe_apply_history(hookimpl)
-            hook._add_hookimpl(hookimpl)
+            hook._register_hookimpl(hookimpl)
         return plugin_name
 
     def parse_hookimpl_opts(self, plugin: _Plugin, name: str) -> HookimplOpts | None:

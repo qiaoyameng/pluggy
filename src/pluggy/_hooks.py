@@ -11,6 +11,7 @@ from ._caller import _HookCaller
 from ._caller import _HookExec
 from ._caller import _HookRelay
 from ._caller import _SubsetHookCaller
+from ._caller import HistoricCall
 from ._caller import HookCaller
 from ._caller import HookRelay
 from ._config import HookimplOpts
@@ -31,6 +32,7 @@ __all__ = [
     "HookImpl",
     "HookRelay",
     "HookSpec",
+    "HistoricCall",
     "HookimplMarker",
     "HookimplOpts",
     "HookspecMarker",

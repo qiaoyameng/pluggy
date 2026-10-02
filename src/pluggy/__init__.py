@@ -1,4 +1,5 @@
 __all__ = [
+    "HistoricCall",
     "HookCallError",
     "HookCaller",
     "HookImpl",
@@ -14,6 +15,8 @@ __all__ = [
     "Result",
     "__version__",
 ]
+
+from ._hooks import HistoricCall
 from ._hooks import HookCaller
 from ._hooks import HookImpl
 from ._hooks import HookimplMarker

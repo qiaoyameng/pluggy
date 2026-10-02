@@ -29,6 +29,9 @@ API Reference
     :members:
     :special-members: __call__
 
+.. autoclass:: pluggy.HistoricCall()
+    :members:
+
 .. autoclass:: pluggy.HookCallError()
     :show-inheritance:
     :members:

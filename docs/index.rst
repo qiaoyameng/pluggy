@@ -707,6 +707,18 @@ immediately at register time and **can not** return a result to the caller.
 This turns out to be particularly useful when dealing with lazy or
 dynamically loaded plugins.
 
+Pass ``history_size`` to keep only the most recent historic calls in memory:
+
+.. code-block:: python
+
+    @hookspec(historic=True, history_size=100)
+    def myhook(config, args):
+        pass
+
+Calls use monotonically increasing IDs starting at one. If the first retained
+call has a higher ID, history was bounded or explicitly cleared, so late
+registered plugins did not receive all earlier calls.
+
 For more info see :ref:`call_historic`.
 
 
@@ -992,6 +1004,13 @@ using the :py:meth:`~pluggy.HookCaller.call_historic()` method:
     pm.hook.myhook.call_historic(
         kwargs={"config": config, "args": sys.argv}, result_callback=callback
     )
+
+The method returns the call's ID. ``get_history()`` lists the retained calls,
+``get_next_call_id()`` returns the following ID, and
+``history_start_call_id`` gives the ID of the oldest retained call.
+``clear_history(call_id)`` drops retained calls through the given ID (or all
+retained calls when called without an argument), releasing the corresponding
+call payloads and result callbacks.
 
     # ... more of our program ...
 

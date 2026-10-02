@@ -4,10 +4,13 @@ Hook callers and relay.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 from typing import Final
 from typing import final
@@ -48,16 +51,64 @@ class HookRelay:
 _HookRelay = HookRelay
 
 
-_CallHistory: TypeAlias = list[
-    tuple[Mapping[str, object], Callable[[Any], None] | None]
-]
+@final
+@dataclass(frozen=True, slots=True)
+class HistoricCall:
+    """A historic hook call available for replay."""
+
+    call_id: int
+    kwargs: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoryEntry:
+    call_id: int
+    kwargs: Mapping[str, object]
+    result_callback: Callable[[Any], None] | None
+
+
+@dataclass(slots=True)
+class _CallHistoryStore:
+    size: int | None
+    entries: deque[_HistoryEntry]
+    next_call_id: int = 1
+
+    def add(
+        self,
+        kwargs: Mapping[str, object],
+        result_callback: Callable[[Any], None] | None,
+    ) -> _HistoryEntry:
+        entry = _HistoryEntry(self.next_call_id, kwargs, result_callback)
+        self.next_call_id += 1
+        self.entries.append(entry)
+        if self.size is not None:
+            while len(self.entries) > self.size:
+                self.entries.popleft()
+        return entry
+
+    def clear(self, call_id: int | None = None) -> int:
+        if call_id is None:
+            removed = len(self.entries)
+            self.entries.clear()
+            return removed
+        removed = 0
+        while self.entries and self.entries[0].call_id <= call_id:
+            self.entries.popleft()
+            removed += 1
+        return removed
+
+    def calls(self) -> list[HistoricCall]:
+        return [HistoricCall(entry.call_id, entry.kwargs) for entry in self.entries]
 
 
 class HookCaller:
     """A caller of all registered implementations of a hook specification."""
 
     __slots__ = (
+        "_active_calls",
+        "_active_replays",
         "_call_history",
+        "_history_lock",
         "_hookexec",
         "_hookimpls",
         "name",
@@ -83,7 +134,10 @@ class HookCaller:
         # 5. wrappers
         # 6. tryfirst wrappers
         self._hookimpls: Final[list[HookImpl]] = []
-        self._call_history: _CallHistory | None = None
+        self._active_calls: Final[list[_HistoryEntry]] = []
+        self._active_replays: Final[list[list[_HistoryEntry]]] = []
+        self._call_history: _CallHistoryStore | None = None
+        self._history_lock: Final = RLock()
         # TODO: Document, or make private.
         self.spec: HookSpec | None = None
         if specmodule_or_class is not None:
@@ -107,7 +161,16 @@ class HookCaller:
             )
         self.spec = HookSpec(specmodule_or_class, self.name, spec_opts)
         if spec_opts.get("historic"):
-            self._call_history = []
+            history_size = spec_opts.get("history_size")
+            if history_size is not None and (
+                isinstance(history_size, bool) or not isinstance(history_size, int)
+            ):
+                raise TypeError("history_size must be an integer or None")
+            if history_size is not None and history_size < 0:
+                raise ValueError("history_size must be non-negative")
+            self._call_history = _CallHistoryStore(history_size, deque())
+        elif spec_opts.get("history_size") is not None:
+            raise ValueError("history_size requires historic=True")
 
     def is_historic(self) -> bool:
         """Whether this caller is :ref:`historic <historic>`."""
@@ -202,7 +265,7 @@ class HookCaller:
         self,
         result_callback: Callable[[Any], None] | None = None,
         kwargs: Mapping[str, object] | None = None,
-    ) -> None:
+    ) -> int:
         """Call the hook with given ``kwargs`` for all registered plugins and
         for all plugins which will be registered afterwards, see
         :ref:`historic`.
@@ -210,21 +273,58 @@ class HookCaller:
         :param result_callback:
             If provided, will be called for each non-``None`` result obtained
             from a hook implementation.
+
+        :returns:
+            The monotonically increasing call ID.
         """
-        assert self._call_history is not None
+        history = self._require_history()
         kwargs = kwargs or {}
         kwargs = self._apply_defaults(kwargs)
         self._verify_all_args_are_provided(kwargs)
-        self._call_history.append((kwargs, result_callback))
-        # Historizing hooks don't return results.
-        # Remember firstresult isn't compatible with historic.
-        # Copy because plugins may register other plugins during iteration (#438).
-        res = self._hookexec(self.name, self._hookimpls.copy(), kwargs, False)
-        if result_callback is None:
-            return
-        if isinstance(res, list):
-            for x in res:
-                result_callback(x)
+        with self._history_lock:
+            entry = history.add(kwargs, result_callback)
+            for replay in self._active_replays:
+                replay.append(entry)
+            res = self._execute_history_entry(entry, self._hookimpls.copy())
+            if result_callback is not None and isinstance(res, list):
+                for x in res:
+                    result_callback(x)
+            return entry.call_id
+
+    def get_history(self) -> list[HistoricCall]:
+        """Return the historic calls currently retained for replay."""
+        history = self._require_history()
+        with self._history_lock:
+            return history.calls()
+
+    def get_next_call_id(self) -> int:
+        """Return the ID that the next historic call will use."""
+        history = self._require_history()
+        with self._history_lock:
+            return history.next_call_id
+
+    @property
+    def history_start_call_id(self) -> int | None:
+        """ID of the oldest retained call, or ``None`` when none are retained."""
+        history = self._require_history()
+        with self._history_lock:
+            if not history.entries:
+                return None
+            return history.entries[0].call_id
+
+    def clear_history(self, call_id: int | None = None) -> int:
+        """Remove retained historic calls through ``call_id``."""
+        history = self._require_history()
+        if call_id is not None and (
+            isinstance(call_id, bool) or not isinstance(call_id, int)
+        ):
+            raise TypeError("call_id must be an integer or None")
+        if call_id is not None and call_id < 1:
+            raise ValueError("call_id must be positive")
+        with self._history_lock:
+            if call_id is not None and call_id >= history.next_call_id:
+                raise ValueError("call_id refers to a call which has not happened")
+            return history.clear(call_id)
 
     def call_extra(
         self, methods: Sequence[Callable[..., object]], kwargs: Mapping[str, object]
@@ -263,14 +363,78 @@ class HookCaller:
 
     def _maybe_apply_history(self, method: HookImpl) -> None:
         """Apply call history to a new hookimpl if it is marked as historic."""
-        if self.is_historic():
-            assert self._call_history is not None
-            for kwargs, result_callback in self._call_history:
-                res = self._hookexec(self.name, [method], kwargs, False)
-                if res and result_callback is not None:
-                    # XXX: remember firstresult isn't compat with historic
-                    assert isinstance(res, list)
-                    result_callback(res[0])
+        history = self._call_history
+        if history is None:
+            return
+        with self._history_lock:
+            self._replay_history(method, history)
+
+    def _register_hookimpl(self, hookimpl: HookImpl) -> None:
+        """Add a hookimpl and atomically replay historic calls."""
+        history = self._call_history
+        if history is None:
+            self._add_hookimpl(hookimpl)
+            return
+        with self._history_lock:
+            self._replay_history(hookimpl, history)
+            self._add_hookimpl(hookimpl)
+
+    def _replay_history(
+        self,
+        method: HookImpl,
+        history: _CallHistoryStore,
+    ) -> None:
+        entries = list(history.entries)
+        seen = {entry.call_id for entry in entries}
+        for entry in self._active_calls:
+            if entry.call_id not in seen:
+                entries.append(entry)
+                seen.add(entry.call_id)
+        for replay in self._active_replays:
+            for entry in replay:
+                if entry.call_id not in seen:
+                    entries.append(entry)
+                    seen.add(entry.call_id)
+        self._active_replays.append(entries)
+        try:
+            self._apply_history(method, entries)
+        finally:
+            for index, replay in enumerate(self._active_replays):
+                if replay is entries:
+                    del self._active_replays[index]
+                    break
+
+    def _apply_history(
+        self,
+        method: HookImpl,
+        entries: Sequence[_HistoryEntry],
+    ) -> None:
+        for entry in entries:
+            res = self._execute_history_entry(entry, [method])
+            if res and entry.result_callback is not None:
+                # XXX: remember firstresult isn't compat with historic
+                assert isinstance(res, list)
+                entry.result_callback(res[0])
+
+    def _execute_history_entry(
+        self,
+        entry: _HistoryEntry,
+        hookimpls: Sequence[HookImpl],
+    ) -> object | list[object]:
+        self._active_calls.append(entry)
+        try:
+            return self._hookexec(self.name, list(hookimpls), entry.kwargs, False)
+        finally:
+            for index in range(len(self._active_calls) - 1, -1, -1):
+                if self._active_calls[index] is entry:
+                    del self._active_calls[index]
+                    break
+
+    def _require_history(self) -> _CallHistoryStore:
+        history = self._call_history
+        if history is None:
+            raise RuntimeError(f"Hook {self.name!r} is not historic")
+        return history
 
 
 # Historical name (pluggy<=1.2), kept for backward compatibility.
@@ -315,8 +479,20 @@ class _SubsetHookCaller(HookCaller):
         return self._orig.spec
 
     @property
-    def _call_history(self) -> _CallHistory | None:  # type: ignore[override]
+    def _call_history(self) -> _CallHistoryStore | None:  # type: ignore[override]
         return self._orig._call_history
+
+    @property
+    def _history_lock(self) -> RLock:  # type: ignore[misc]
+        return self._orig._history_lock
+
+    @property
+    def _active_calls(self) -> list[_HistoryEntry]:  # type: ignore[misc]
+        return self._orig._active_calls
+
+    @property
+    def _active_replays(self) -> list[list[_HistoryEntry]]:  # type: ignore[misc]
+        return self._orig._active_replays
 
     def __repr__(self) -> str:
         return f"<_SubsetHookCaller {self.name!r}>"
