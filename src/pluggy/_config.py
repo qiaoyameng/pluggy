@@ -15,6 +15,9 @@ class HookspecOpts(TypedDict):
     firstresult: bool
     #: Whether the hook is :ref:`historic <historic>`.
     historic: bool
+    #: Maximum number of :ref:`historic <historic>` calls kept in memory.
+    #: ``None`` (the default) keeps every call.
+    history_size: int | None
     #: Whether the hook :ref:`warns when implemented <warn_on_impl>`.
     warn_on_impl: Warning | None
     #: Whether the hook warns when :ref:`certain arguments are requested

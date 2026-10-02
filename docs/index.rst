@@ -709,6 +709,43 @@ dynamically loaded plugins.
 
 For more info see :ref:`call_historic`.
 
+By default every historic call is kept in memory for the entire lifetime of
+the :class:`~pluggy.HookCaller`. For long-running hosts this can accumulate
+indefinitely. Pass ``history_size`` to the marker to cap how many of the most
+recent calls are retained:
+
+.. code-block:: python
+
+    @hookspec(historic=True, history_size=100)
+    def myhook(config, args):
+        pass
+
+When the cap is exceeded the oldest calls (their arguments and any
+``result_callback``) are released and are no longer replayed. Every call
+still receives a strictly increasing sequence number, returned by
+:py:meth:`~pluggy.HookCaller.call_historic()`. A plugin registered after
+some calls were dropped can detect the gap instead of assuming it received
+the complete history:
+
+.. code-block:: python
+
+    caller = pm.hook.myhook
+    if caller.history_dropped:
+        print(f"missed {caller.history_dropped} earlier calls")
+
+You can also release retained calls yourself with
+:py:meth:`~pluggy.HookCaller.clear_history`, passing the sequence number of
+the last call to drop:
+
+.. code-block:: python
+
+    seq = pm.hook.myhook.call_historic(kwargs={"config": config})
+    # ... once the call no longer needs to be replayed ...
+    pm.hook.myhook.clear_history(upto=seq)
+
+Specifying ``history_size`` (including ``0``) implies ``historic=True``.
+Omitting it keeps the default, unlimited behavior.
+
 
 .. _warn_on_impl:
 

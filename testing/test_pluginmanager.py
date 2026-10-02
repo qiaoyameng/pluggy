@@ -2,8 +2,10 @@
 ``PluginManager`` unit and public API testing.
 """
 
+import gc
 import importlib.metadata
 import types
+import weakref
 from typing import Any
 from typing import cast
 
@@ -1281,3 +1283,422 @@ def test_get_hookcallers_no_duplicates(pm: PluginManager) -> None:
     # Both hello impls are still wired up, and each caller works.
     assert pm.hook.hello(arg=1) == [101, 2]
     assert pm.hook.goodbye(arg=1) == [201]
+
+
+class _Payload:
+    pass
+
+
+def test_historic_history_size_gap_replay_and_gc(pm: PluginManager) -> None:
+    """With ``history_size=3`` and five calls, a late plugin sees the gap and
+    receives only the last three calls, while dropped payloads are released."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=3)
+        def he_method1(self, arg: object) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+
+    refs: list[weakref.ref[_Payload]] = []
+    seqs = []
+    for _ in range(5):
+        payload = _Payload()
+        refs.append(weakref.ref(payload))
+        seqs.append(hook.call_historic(kwargs={"arg": payload}))
+
+    # Monotonically increasing sequence numbers.
+    assert seqs == [1, 2, 3, 4, 5]
+    assert hook.history_start == 3
+    assert hook.history_end == 5
+    assert hook.history_dropped == 2
+
+    # The two dropped payloads must be collectable; the retained ones alive.
+    gc.collect()
+    assert refs[0]() is None
+    assert refs[1]() is None
+    assert [r() is not None for r in refs[2:]] == [True, True, True]
+
+    out: list[object] = []
+
+    class Collect:
+        @hookimpl
+        def he_method1(self, arg: object) -> None:
+            out.append(arg)
+
+    pm.register(Collect())
+    assert len(out) == 3
+    assert out == [refs[2](), refs[3](), refs[4]()]
+    assert hook.history_dropped == 2
+
+
+def test_historic_history_size_last_three_results(pm: PluginManager) -> None:
+    """A plugin registered after bounded historic calls receives the last three
+    results through the per-call ``result_callback``."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=3)
+        def he_method1(self, arg: int) -> int: ...
+
+    pm.add_hookspecs(Hooks)
+
+    results: list[int] = []
+    seqs = [
+        pm.hook.he_method1.call_historic(
+            result_callback=results.append, kwargs={"arg": i}
+        )
+        for i in range(1, 6)
+    ]
+    assert seqs == [1, 2, 3, 4, 5]
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: int) -> int:
+            return arg * 10
+
+    pm.register(Plugin())
+    # Only the three retained calls are replayed, in order.
+    assert results == [30, 40, 50]
+    assert pm.hook.he_method1.history_dropped == 2
+
+
+def test_historic_history_size_zero_retains_nothing(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True, history_size=0)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+    assert [hook.call_historic(kwargs={"arg": i}) for i in range(3)] == [1, 2, 3]
+    assert hook.history_start is None
+    assert hook.history_end is None
+    assert hook.history_dropped == 3
+
+    out: list[int] = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: int) -> None:
+            out.append(arg)
+
+    pm.register(Plugin())
+    assert out == []
+
+    # New calls still go to already registered plugins.
+    hook.call_historic(kwargs={"arg": 4})
+    assert out == [4]
+    assert hook.history_dropped == 4
+
+
+def test_history_size_implies_historic(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(history_size=2)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+    assert hook.is_historic()
+    with pytest.raises(AssertionError):
+        hook(arg=1)
+    hook.call_historic(kwargs={"arg": 1})
+
+
+@pytest.mark.parametrize(
+    ("value", "exc", "match"),
+    [
+        (-1, ValueError, "history_size must be >= 0"),
+        (1.5, TypeError, "history_size must be an int or None"),
+        (True, TypeError, "history_size must be an int or None"),
+        ("3", TypeError, "history_size must be an int or None"),
+    ],
+)
+def test_history_size_validation(value: object, exc: type, match: str) -> None:
+    with pytest.raises(exc, match=match):
+        hookspec(history_size=value)(any)
+
+
+def test_history_size_incompatible_with_firstresult() -> None:
+    with pytest.raises(ValueError, match="cannot have a historic firstresult"):
+        hookspec(history_size=3, firstresult=True)(any)
+
+
+def test_clear_history_upto(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+    seqs = [hook.call_historic(kwargs={"arg": i}) for i in range(1, 6)]
+    assert seqs == [1, 2, 3, 4, 5]
+
+    assert hook.clear_history(upto=2) == 2
+    assert hook.history_dropped == 2
+    assert hook.history_start == 3
+    assert hook.history_end == 5
+
+    # Clearing up to an already-cleared sequence drops nothing more.
+    assert hook.clear_history(upto=2) == 0
+    assert hook.history_dropped == 2
+
+    out: list[int] = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: int) -> None:
+            out.append(arg)
+
+    pm.register(Plugin())
+    assert out == [3, 4, 5]
+
+
+def test_clear_history_all(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+    for i in range(3):
+        hook.call_historic(kwargs={"arg": i})
+
+    assert hook.clear_history() == 3
+    assert hook.history_dropped == 3
+    assert hook.history_start is None
+    assert hook.history_end is None
+
+    out: list[int] = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: int) -> None:
+            out.append(arg)
+
+    pm.register(Plugin())
+    assert out == []
+
+    # The sequence counter keeps counting past the gap.
+    seq = hook.call_historic(kwargs={"arg": 9})
+    assert seq == 4
+    assert out == [9]
+    assert hook.history_start == 4
+    assert hook.history_end == 4
+
+
+def test_clear_history_releases_payload_and_callback(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: object) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+
+    payload_refs: list[weakref.ref[_Payload]] = []
+
+    class Recorder:
+        def __call__(self, result: object) -> None:
+            raise AssertionError("never called")
+
+    callback_refs: list[weakref.ref[Recorder]] = []
+    for _ in range(5):
+        payload = _Payload()
+        recorder = Recorder()
+        payload_refs.append(weakref.ref(payload))
+        callback_refs.append(weakref.ref(recorder))
+        hook.call_historic(
+            result_callback=recorder, kwargs={"arg": payload}
+        )
+        del payload, recorder
+
+    assert hook.clear_history(upto=2) == 2
+    gc.collect()
+    assert payload_refs[0]() is None
+    assert payload_refs[1]() is None
+    assert callback_refs[0]() is None
+    assert callback_refs[1]() is None
+    assert [r() is not None for r in payload_refs[2:]] == [True, True, True]
+    assert [r() is not None for r in callback_refs[2:]] == [True, True, True]
+
+
+def test_clear_history_on_non_historic(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    assert pm.hook.he_method1.clear_history() == 0
+    assert pm.hook.he_method1.history_dropped == 0
+    assert pm.hook.he_method1.history_start is None
+    assert pm.hook.he_method1.history_end is None
+
+
+def test_clear_history_upto_before_first(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+    hook.call_historic(kwargs={"arg": 1})
+    assert hook.clear_history(upto=0) == 0
+    assert hook.history_start == 1
+    assert hook.clear_history(upto=-10) == 0
+    assert hook.history_dropped == 0
+
+
+def test_clear_history_invalid_upto(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    pm.hook.he_method1.call_historic(kwargs={"arg": 1})
+
+    for bad in ("1", True):
+        with pytest.raises(TypeError, match="upto must be an int"):
+            pm.hook.he_method1.clear_history(upto=bad)  # type: ignore[arg-type]
+
+
+def test_historic_replay_skips_none_results(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: int) -> int | None: ...
+
+    pm.add_hookspecs(Hooks)
+    out: list[int] = []
+    pm.hook.he_method1.call_historic(
+        result_callback=out.append, kwargs={"arg": 1}
+    )
+
+    class NonePlugin:
+        @hookimpl
+        def he_method1(self, arg: int) -> None:
+            return None
+
+    class ValuePlugin:
+        @hookimpl
+        def he_method1(self, arg: int) -> int:
+            return arg
+
+    pm.register(NonePlugin())
+    pm.register(ValuePlugin())
+    assert out == [1]
+
+
+def test_historic_replay_with_reentrant_call_and_register(
+    pm: PluginManager,
+) -> None:
+    """Calls and registrations happening during replay must not be lost,
+    duplicated, or delivered out of order."""
+
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+    hook.call_historic(kwargs={"arg": 1})
+    hook.call_historic(kwargs={"arg": 2})
+
+    log: list[tuple[str, int]] = []
+
+    class Late:
+        @hookimpl
+        def he_method1(self, arg: int) -> None:
+            log.append(("A", arg))
+            if arg == 1:
+                # A new historic call during A's own replay loop.
+                hook.call_historic(kwargs={"arg": 99})
+
+                # Nested registration while replay is in progress.
+                class Nested:
+                    @hookimpl
+                    def he_method1(self, arg: int) -> None:
+                        log.append(("B", arg))
+
+                pm.register(Nested())
+
+    pm.register(Late())
+    # A sees the original two calls plus its own reentrant call, in order.
+    assert [a for who, a in log if who == "A"] == [1, 2, 99]
+    # B gets the whole history up to registration in call order, and the
+    # reentrant call exactly once.
+    assert [a for who, a in log if who == "B"] == [1, 2, 99]
+
+
+def test_historic_bounded_replay_with_reentrant_eviction(
+    pm: PluginManager,
+) -> None:
+    """Reentrant bounded calls that evict entries during replay must not
+    cause skipped, duplicated, or out-of-order delivery."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=4)
+        def he_method1(self, arg: int) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+    for i in (1, 2, 3, 4):
+        hook.call_historic(kwargs={"arg": i})
+
+    log: list[int] = []
+
+    class Late:
+        @hookimpl
+        def he_method1(self, arg: int) -> None:
+            log.append(arg)
+            if arg == 1:
+                # Two more bounded calls evict calls 1 and 2 while the
+                # replay of the retained history is still in progress.
+                hook.call_historic(kwargs={"arg": 5})
+                hook.call_historic(kwargs={"arg": 6})
+
+    pm.register(Late())
+    # Call 1 is delivered once (its replay had started); call 2 is evicted
+    # before it is reached; the rest follow in increasing sequence order.
+    assert log == [1, 3, 4, 5, 6]
+    assert hook.history_start == 3
+    assert hook.history_end == 6
+    assert hook.history_dropped == 2
+
+
+def test_historic_bounded_subset_hook_caller(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg: int) -> int: ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+
+    for i in (1, 2, 3):
+        hook.call_historic(kwargs={"arg": i})
+
+    class Removed:
+        @hookimpl
+        def he_method1(self, arg: int) -> int:
+            return arg
+
+    removed = Removed()
+    pm.register(removed)
+    subset = pm.subset_hook_caller("he_method1", remove_plugins=[removed])
+    assert subset.history_start == 2
+    assert subset.history_end == 3
+    assert subset.history_dropped == 1
+
+    out: list[int] = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: int) -> int:
+            out.append(arg * 10)
+            return arg * 10
+
+    # A late plugin registered through the subset shares the same bounded
+    # history and only replays the retained calls.
+    pm.register(Plugin())
+    assert out == [20, 30]
+
+    out.clear()
+    subset.call_historic(kwargs={"arg": 4})
+    # The removed plugin never answers; the retained plugin gets call 4.
+    assert out == [40]

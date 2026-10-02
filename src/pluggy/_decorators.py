@@ -46,6 +46,7 @@ class HookspecMarker:
         function: _F,
         firstresult: bool = False,
         historic: bool = False,
+        history_size: int | None = None,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
     ) -> _F: ...
@@ -56,6 +57,7 @@ class HookspecMarker:
         function: None = ...,
         firstresult: bool = ...,
         historic: bool = ...,
+        history_size: int | None = ...,
         warn_on_impl: Warning | None = ...,
         warn_on_impl_args: Mapping[str, Warning] | None = ...,
     ) -> Callable[[_F], _F]: ...
@@ -65,6 +67,7 @@ class HookspecMarker:
         function: _F | None = None,
         firstresult: bool = False,
         historic: bool = False,
+        history_size: int | None = None,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
     ) -> _F | Callable[[_F], _F]:
@@ -83,6 +86,14 @@ class HookspecMarker:
             If ``True``, every call to the hook will be memorized and replayed
             on plugins registered after the call was made. See :ref:`historic`.
 
+        :param history_size:
+            If provided with an integer, only the given number of most recent
+            historic calls are kept in memory and replayed for newly
+            registered plugins. Older calls are dropped, which plugins can
+            detect via :attr:`HookCaller.history_dropped`. Use
+            :meth:`HookCaller.clear_history` to drop retained calls manually.
+            Implies ``historic=True``.
+
         :param warn_on_impl:
             If given, every implementation of this hook will trigger the given
             warning. See :ref:`warn_on_impl`.
@@ -96,11 +107,19 @@ class HookspecMarker:
         """
 
         def setattr_hookspec_opts(func: _F) -> _F:
-            if historic and firstresult:
+            _historic = historic or history_size is not None
+            if history_size is not None and (
+                isinstance(history_size, bool) or not isinstance(history_size, int)
+            ):
+                raise TypeError("history_size must be an int or None")
+            if history_size is not None and history_size < 0:
+                raise ValueError("history_size must be >= 0")
+            if _historic and firstresult:
                 raise ValueError("cannot have a historic firstresult hook")
             opts: HookspecOpts = {
                 "firstresult": firstresult,
-                "historic": historic,
+                "historic": _historic,
+                "history_size": history_size,
                 "warn_on_impl": warn_on_impl,
                 "warn_on_impl_args": warn_on_impl_args,
             }

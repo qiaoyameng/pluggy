@@ -1,0 +1,5 @@
+Historic hooks now support a ``history_size`` option to bound the number of
+retained calls, along with ``HookCaller.clear_history()`` to release calls
+manually. ``call_historic()`` returns a strictly increasing sequence number
+and ``HookCaller.history_dropped`` / ``history_start`` / ``history_end`` let
+late registered plugins detect gaps in the history.
