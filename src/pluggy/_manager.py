@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 from collections.abc import Sequence
 import inspect
+import time
 import types
 from typing import Any
 from typing import cast
@@ -26,6 +27,16 @@ from ._hooks import HookimplOpts
 from ._hooks import HookRelay
 from ._hooks import HookspecOpts
 from ._hooks import normalize_hookimpl_opts
+from ._observation import HookCallObservation
+from ._observation import HookImplObserver
+from ._observation import ObserverEntry
+from ._observation import ObserverErrorHandler
+from ._observation import TimeSource
+from ._observation import current_hook_call_id
+from ._observation import log_observer_error
+from ._observation import next_call_id
+from ._observation import reset_current_hook_call_observation
+from ._observation import set_current_hook_call_observation
 from ._result import Result
 
 
@@ -37,6 +48,7 @@ _BeforeTrace: TypeAlias = Callable[[str, Sequence[HookImpl], Mapping[str, Any]],
 _AfterTrace: TypeAlias = Callable[
     [Result[Any], str, Sequence[HookImpl], Mapping[str, Any]], None
 ]
+_HookImplObservers: TypeAlias = tuple[ObserverEntry, ...]
 
 
 def _warn_for_function(warning: Warning, function: Callable[..., object]) -> None:
@@ -170,6 +182,7 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        self._hookimpl_observers: _HookImplObservers = ()
 
     def _hookexec(
         self,
@@ -180,7 +193,27 @@ class PluginManager:
     ) -> object | list[object]:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
-        return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+        observers = self._hookimpl_observers
+        if not observers:
+            if current_hook_call_id() is None:
+                return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+            observation_token = set_current_hook_call_observation(None)
+            try:
+                return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+            finally:
+                reset_current_hook_call_observation(observation_token)
+
+        parent_call_id = current_hook_call_id()
+        observation = HookCallObservation(
+            observers,
+            next_call_id(),
+            parent_call_id,
+        )
+        observation_token = set_current_hook_call_observation(observation)
+        try:
+            return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+        finally:
+            reset_current_hook_call_observation(observation_token)
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.
@@ -586,6 +619,35 @@ class PluginManager:
 
         def undo() -> None:
             self._inner_hookexec = oldcall
+
+        return undo
+
+    def add_hookimpl_observer(
+        self,
+        observer: HookImplObserver,
+        *,
+        time_source: TimeSource = time.perf_counter,
+        on_observer_error: ObserverErrorHandler = log_observer_error,
+    ) -> Callable[[], None]:
+        """Add an observer for individual hook implementation execution.
+
+        The observer receives start/end events for ordinary hook
+        implementations and enter/exit events for wrappers.
+
+        Exceptions raised by the observer are passed to
+        ``on_observer_error`` and do not replace the hook's exception or
+        return value.
+        """
+        entry = ObserverEntry(observer, time_source, on_observer_error)
+        self._hookimpl_observers = (*self._hookimpl_observers, entry)
+
+        def undo() -> None:
+            remaining = tuple(
+                registered
+                for registered in self._hookimpl_observers
+                if registered is not entry
+            )
+            self._hookimpl_observers = remaining
 
         return undo
 

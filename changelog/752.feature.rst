@@ -1,0 +1,3 @@
+Added ``PluginManager.add_hookimpl_observer`` for observing individual hook
+implementation and wrapper execution timing, including nested call identifiers
+and an injectable time source.

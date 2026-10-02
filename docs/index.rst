@@ -1073,6 +1073,29 @@ The expected signature and default implementations for these functions is:
     def after(outcome, hook_name, hook_impls, kwargs):
         pass
 
+
+Implementation observation
+--------------------------
+To identify which individual hook implementation is slow, add an
+implementation observer with
+:py:class:`pluggy.PluginManager.add_hookimpl_observer()`. The observer is called
+with :class:`pluggy.HookImplEvent` objects at implementation start/end and at
+wrapper enter/exit boundaries. Each event includes the hook multicall identifier
+and, for nested calls, the parent multicall identifier.
+
+Observer exceptions are sent to the configured diagnostic handler (the Python
+logging framework by default) and never replace a plugin exception or return
+value.
+
+.. code-block:: python
+
+    def observer(event):
+        if not event.wrapper and event.phase == "end":
+            print(event.plugin_name, event.elapsed)
+
+
+    undo = pm.add_hookimpl_observer(observer)
+
 Public API
 **********
 Please see the :doc:`api_reference`.

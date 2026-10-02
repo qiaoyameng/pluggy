@@ -40,6 +40,9 @@ API Reference
 .. autoclass:: pluggy.HookImpl()
     :members:
 
+.. autoclass:: pluggy.HookImplEvent()
+    :members:
+
 .. autoclass:: pluggy.HookspecOpts()
     :show-inheritance:
     :members:

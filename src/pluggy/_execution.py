@@ -14,6 +14,8 @@ from typing import TypeAlias
 import warnings
 
 from ._impl import HookImpl
+from ._observation import ObservedSpan
+from ._observation import current_hook_call_observation
 from ._result import HookCallError
 from ._result import Result
 from ._warnings import PluggyTeardownRaisedWarning
@@ -29,22 +31,37 @@ def run_old_style_hookwrapper(
     hook_name: str,
     args: Sequence[object],
     kwargs: Mapping[str, object] | None,
+    wrapper_span: ObservedSpan | None = None,
 ) -> Teardown:
     """
     backward compatibility wrapper to run a old style hookwrapper as a wrapper
     """
-    if kwargs is None:
-        res = hook_impl.function(*args)
-    else:
-        res = hook_impl.function(*args, **kwargs)
-    if TYPE_CHECKING:
-        teardown = cast(Teardown, res)
-    else:
-        teardown = res
+    setup_failed = False
     try:
-        next(teardown)
-    except StopIteration:
-        _raise_wrapfail(teardown, "did not yield")
+        if wrapper_span is not None:
+            wrapper_span.start("wrapper_enter")
+        if kwargs is None:
+            res = hook_impl.function(*args)
+        else:
+            res = hook_impl.function(*args, **kwargs)
+        if TYPE_CHECKING:
+            teardown = cast(Teardown, res)
+        else:
+            teardown = res
+        try:
+            next(teardown)
+        except StopIteration:
+            setup_failed = True
+            try:
+                _raise_wrapfail(teardown, "did not yield")
+            except BaseException as setup_exc:
+                if wrapper_span is not None:
+                    wrapper_span.finish("wrapper_exit", exception=setup_exc)
+                raise
+    except BaseException as exc:
+        if wrapper_span is not None and not setup_failed:
+            wrapper_span.finish("wrapper_exit", exception=exc)
+        raise
     try:
         res = yield
         result = Result(res, None)
@@ -98,9 +115,10 @@ def _multicall(
     ``caller_kwargs`` comes from HookCaller.__call__().
     """
     __tracebackhide__ = True
+    observation = current_hook_call_observation()
     results: list[object] = []
     exception = None
-    teardowns: list[Teardown] = []
+    teardowns: list[tuple[Teardown, ObservedSpan | None]] = []
     try:  # run impl and wrapper setup functions in a loop
         for hook_impl in reversed(hook_impls):
             try:
@@ -118,35 +136,71 @@ def _multicall(
                     f"hook call must provide argument {e.args[0]!r}"
                 ) from e
 
+            wrapper_span: ObservedSpan | None = None
             if hook_impl.hookwrapper:
+                if observation is not None:
+                    wrapper_span = observation.span(hook_name, hook_impl)
                 function_gen = run_old_style_hookwrapper(
-                    hook_impl, hook_name, args, kwargs
+                    hook_impl, hook_name, args, kwargs, wrapper_span
                 )
 
                 next(function_gen)  # first yield
-                teardowns.append(function_gen)
+                teardowns.append((function_gen, wrapper_span))
 
             elif hook_impl.wrapper:
-                if kwargs is None:
-                    res = hook_impl.function(*args)
-                else:
-                    res = hook_impl.function(*args, **kwargs)
-                # If this cast is not valid, a type error is raised below,
-                # which is the desired response.
-                if TYPE_CHECKING:
-                    function_gen = cast(Generator[None, object, object], res)
-                else:
-                    function_gen = res
+                function_gen: Generator[None, object, object] | None = None
+                setup_failed = False
                 try:
+                    if observation is not None:
+                        wrapper_span = observation.span(hook_name, hook_impl)
+                        wrapper_span.start("wrapper_enter")
+                    if kwargs is None:
+                        res = hook_impl.function(*args)
+                    else:
+                        res = hook_impl.function(*args, **kwargs)
+                    # If this cast is not valid, a type error is raised below,
+                    # which is the desired response.
+                    if TYPE_CHECKING:
+                        function_gen = cast(Generator[None, object, object], res)
+                    else:
+                        function_gen = res
                     next(function_gen)  # first yield
                 except StopIteration:
-                    _raise_wrapfail(function_gen, "did not yield")
-                teardowns.append(function_gen)
+                    if function_gen is None:
+                        raise
+                    setup_failed = True
+                    try:
+                        _raise_wrapfail(function_gen, "did not yield")
+                    except BaseException as setup_exc:
+                        if wrapper_span is not None:
+                            wrapper_span.finish(
+                                "wrapper_exit", exception=setup_exc
+                            )
+                        raise
+                except BaseException as exc:
+                    if wrapper_span is not None and not setup_failed:
+                        wrapper_span.finish("wrapper_exit", exception=exc)
+                    raise
+                teardowns.append((function_gen, wrapper_span))
             else:
-                if kwargs is None:
-                    res = hook_impl.function(*args)
-                else:
-                    res = hook_impl.function(*args, **kwargs)
+                implementation_span = (
+                    observation.span(hook_name, hook_impl)
+                    if observation is not None
+                    else None
+                )
+                try:
+                    if implementation_span is not None:
+                        implementation_span.start("implementation_start")
+                    if kwargs is None:
+                        res = hook_impl.function(*args)
+                    else:
+                        res = hook_impl.function(*args, **kwargs)
+                except BaseException as exc:
+                    if implementation_span is not None:
+                        implementation_span.finish("implementation_end", exception=exc)
+                    raise
+                if implementation_span is not None:
+                    implementation_span.finish("implementation_end", result=res)
                 if res is not None:
                     results.append(res)
                     if firstresult:  # halt further impl calls
@@ -160,7 +214,7 @@ def _multicall(
             result = results
 
         # run all wrapper post-yield blocks
-        for teardown in reversed(teardowns):
+        for teardown, wrapper_span in reversed(teardowns):
             try:
                 if exception is not None:
                     try:
@@ -173,6 +227,10 @@ def _multicall(
                             and re.__cause__ is exception
                         ):
                             teardown.close()
+                            if wrapper_span is not None:
+                                wrapper_span.finish(
+                                    "wrapper_exit", exception=exception
+                                )
                             continue
                         else:
                             raise
@@ -185,11 +243,20 @@ def _multicall(
             except StopIteration as si:
                 result = si.value
                 exception = None
+                if wrapper_span is not None:
+                    wrapper_span.finish("wrapper_exit", result=si.value)
                 continue
             except BaseException as e:
                 exception = e
+                if wrapper_span is not None:
+                    wrapper_span.finish("wrapper_exit", exception=e)
                 continue
-            _raise_wrapfail(teardown, "has second yield")
+            try:
+                _raise_wrapfail(teardown, "has second yield")
+            except BaseException as teardown_exc:
+                if wrapper_span is not None:
+                    wrapper_span.finish("wrapper_exit", exception=teardown_exc)
+                raise
 
     if exception is not None:
         raise exception
