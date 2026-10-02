@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 from collections.abc import Sequence
 import inspect
+import time
 import types
 from typing import Any
 from typing import cast
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING
 from typing import TypeAlias
 import warnings
 
+from . import _observability
 from . import _tracing
 from ._callers import _multicall
 from ._compat import DistFacade
@@ -37,6 +39,7 @@ _BeforeTrace: TypeAlias = Callable[[str, Sequence[HookImpl], Mapping[str, Any]],
 _AfterTrace: TypeAlias = Callable[
     [Result[Any], str, Sequence[HookImpl], Mapping[str, Any]], None
 ]
+_Clock: TypeAlias = Callable[[], float]
 
 
 def _warn_for_function(warning: Warning, function: Callable[..., object]) -> None:
@@ -170,6 +173,10 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        #: Active implementation observers as (observer, clock) pairs.
+        self._observers: Final[
+            list[tuple[_observability.HookImplObserver, _Clock]]
+        ] = []
 
     def _hookexec(
         self,
@@ -177,10 +184,15 @@ class PluginManager:
         methods: Sequence[HookImpl],
         kwargs: Mapping[str, object],
         firstresult: bool,
+        observers: Sequence[_observability.ObserverEntry] | None = None,
     ) -> object | list[object]:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
-        return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+        if observers is None:
+            observers = tuple(self._observers)
+        return self._inner_hookexec(
+            hook_name, methods, kwargs, firstresult, observers
+        )
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.
@@ -574,10 +586,17 @@ class PluginManager:
             hook_impls: Sequence[HookImpl],
             caller_kwargs: Mapping[str, object],
             firstresult: bool,
+            observers: Sequence[_observability.ObserverEntry] = (),
         ) -> object | list[object]:
             before(hook_name, hook_impls, caller_kwargs)
             outcome = Result.from_call(
-                lambda: oldcall(hook_name, hook_impls, caller_kwargs, firstresult)
+                lambda: oldcall(
+                    hook_name,
+                    hook_impls,
+                    caller_kwargs,
+                    firstresult,
+                    observers,
+                )
             )
             after(outcome, hook_name, hook_impls, caller_kwargs)
             return outcome.get_result()
@@ -586,6 +605,45 @@ class PluginManager:
 
         def undo() -> None:
             self._inner_hookexec = oldcall
+
+        return undo
+
+    def add_hookimpl_observer(
+        self,
+        observer: _observability.HookImplObserver,
+        clock: _Clock | None = None,
+    ) -> Callable[[], None]:
+        """Add an implementation-level observer for all hook calls.
+
+        In contrast to :meth:`add_hookcall_monitoring`, the observer is told
+        about each hook implementation that actually runs -- plain
+        implementations and the separate entry/exit phases of wrappers --
+        including start, normal completion and exceptions, together with the
+        id of the call the implementation belongs to (and, for nested calls,
+        the id of the enclosing call).
+
+        :param observer:
+            An object implementing the :class:`HookImplObserver` protocol.
+        :param clock:
+            Optional zero-argument callable returning timestamps (defaults to
+            :func:`time.perf_counter`). Injecting a clock makes recorded
+            sequences and durations deterministic.
+
+        Returns an undo function which, when called, removes the observer.
+
+        Events are delivered one at a time (streaming); pluggy never keeps a
+        list of events. Exceptions raised by ``observer`` are routed to its
+        ``HookImplObserver.on_observer_error`` method and never mask a
+        plugin's own exception or alter a hook call's result.
+        """
+        entry = (observer, clock if clock is not None else time.perf_counter)
+        self._observers.append(entry)
+
+        def undo() -> None:
+            try:
+                self._observers.remove(entry)
+            except ValueError:
+                pass
 
         return undo
 

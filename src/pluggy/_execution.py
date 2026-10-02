@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from typing import TypeAlias
 import warnings
 
+from . import _observability
 from ._impl import HookImpl
 from ._result import HookCallError
 from ._result import Result
@@ -91,17 +92,39 @@ def _multicall(
     hook_impls: Sequence[HookImpl],
     caller_kwargs: Mapping[str, object],
     firstresult: bool,
+    observers: _observability.Sequence[_observability.ObserverEntry] = (),
 ) -> object | list[object]:
     """Execute a call into multiple python functions/methods and return the
     result(s).
 
     ``caller_kwargs`` comes from HookCaller.__call__().
+
+    ``observers`` is an optional sequence of ``(observer, clock)`` pairs
+    installed via :meth:`pluggy.PluginManager.add_hookimpl_observer`.
     """
     __tracebackhide__ = True
+
+    # Observation is opt-in: with no observers, ``sessions`` stays empty and
+    # every observability helper becomes a no-op, so no event objects or even
+    # timestamp tuples are constructed.
+    if observers:
+        sessions, call_id, start_times = _observability.begin_call(
+            observers, hook_name
+        )
+    else:
+        sessions = ()
+        call_id = -1
+        start_times = ()
+    observing = bool(sessions)
+
     results: list[object] = []
     exception = None
-    teardowns: list[Teardown] = []
-    try:  # run impl and wrapper setup functions in a loop
+    teardowns: list[tuple[HookImpl, Teardown]] = []
+
+    token = _observability.set_parent_call_id(call_id) if observing else None
+    try:
+        _observability.emit_hook_call(sessions, start_times)
+        # run impl and wrapper setup functions in a loop
         for hook_impl in reversed(hook_impls):
             try:
                 args = [caller_kwargs[argname] for argname in hook_impl.argnames]
@@ -119,34 +142,109 @@ def _multicall(
                 ) from e
 
             if hook_impl.hookwrapper:
-                function_gen = run_old_style_hookwrapper(
-                    hook_impl, hook_name, args, kwargs
+                phase = _observability.PHASE_WRAPPER_ENTER
+                phase_starts = _observability.start_phase(
+                    sessions, hook_name, hook_impl, phase
                 )
-
-                next(function_gen)  # first yield
-                teardowns.append(function_gen)
+                try:
+                    function_gen = run_old_style_hookwrapper(
+                        hook_impl, hook_name, args, kwargs
+                    )
+                    next(function_gen)  # first yield
+                except BaseException as exc:
+                    _observability.exception_phase(
+                        sessions,
+                        hook_name,
+                        hook_impl,
+                        phase,
+                        phase_starts,
+                        exc,
+                    )
+                    raise
+                _observability.end_phase(
+                    sessions,
+                    hook_name,
+                    hook_impl,
+                    phase,
+                    phase_starts,
+                    None,
+                )
+                teardowns.append((hook_impl, function_gen))
 
             elif hook_impl.wrapper:
-                if kwargs is None:
-                    res = hook_impl.function(*args)
-                else:
-                    res = hook_impl.function(*args, **kwargs)
-                # If this cast is not valid, a type error is raised below,
-                # which is the desired response.
-                if TYPE_CHECKING:
-                    function_gen = cast(Generator[None, object, object], res)
-                else:
-                    function_gen = res
+                phase = _observability.PHASE_WRAPPER_ENTER
+                phase_starts = _observability.start_phase(
+                    sessions, hook_name, hook_impl, phase
+                )
                 try:
+                    if kwargs is None:
+                        res = hook_impl.function(*args)
+                    else:
+                        res = hook_impl.function(*args, **kwargs)
+                    # If this cast is not valid, a type error is raised below,
+                    # which is the desired response.
+                    if TYPE_CHECKING:
+                        function_gen = cast(Generator[None, object, object], res)
+                    else:
+                        function_gen = res
                     next(function_gen)  # first yield
-                except StopIteration:
+                except StopIteration as exc:
+                    _observability.exception_phase(
+                        sessions,
+                        hook_name,
+                        hook_impl,
+                        phase,
+                        phase_starts,
+                        exc,
+                    )
                     _raise_wrapfail(function_gen, "did not yield")
-                teardowns.append(function_gen)
+                except BaseException as exc:
+                    _observability.exception_phase(
+                        sessions,
+                        hook_name,
+                        hook_impl,
+                        phase,
+                        phase_starts,
+                        exc,
+                    )
+                    raise
+                _observability.end_phase(
+                    sessions,
+                    hook_name,
+                    hook_impl,
+                    phase,
+                    phase_starts,
+                    None,
+                )
+                teardowns.append((hook_impl, function_gen))
             else:
-                if kwargs is None:
-                    res = hook_impl.function(*args)
-                else:
-                    res = hook_impl.function(*args, **kwargs)
+                phase = _observability.PHASE_IMPL
+                phase_starts = _observability.start_phase(
+                    sessions, hook_name, hook_impl, phase
+                )
+                try:
+                    if kwargs is None:
+                        res = hook_impl.function(*args)
+                    else:
+                        res = hook_impl.function(*args, **kwargs)
+                except BaseException as exc:
+                    _observability.exception_phase(
+                        sessions,
+                        hook_name,
+                        hook_impl,
+                        phase,
+                        phase_starts,
+                        exc,
+                    )
+                    raise
+                _observability.end_phase(
+                    sessions,
+                    hook_name,
+                    hook_impl,
+                    phase,
+                    phase_starts,
+                    res,
+                )
                 if res is not None:
                     results.append(res)
                     if firstresult:  # halt further impl calls
@@ -160,7 +258,11 @@ def _multicall(
             result = results
 
         # run all wrapper post-yield blocks
-        for teardown in reversed(teardowns):
+        for hook_impl, teardown in reversed(teardowns):
+            phase = _observability.PHASE_WRAPPER_EXIT
+            phase_starts = _observability.start_phase(
+                sessions, hook_name, hook_impl, phase
+            )
             try:
                 if exception is not None:
                     try:
@@ -172,6 +274,14 @@ def _multicall(
                             isinstance(exception, StopIteration)
                             and re.__cause__ is exception
                         ):
+                            _observability.end_phase(
+                                sessions,
+                                hook_name,
+                                hook_impl,
+                                phase,
+                                phase_starts,
+                                None,
+                            )
                             teardown.close()
                             continue
                         else:
@@ -183,15 +293,38 @@ def _multicall(
                 # Note: close() may raise if generator handles GeneratorExit.
                 teardown.close()
             except StopIteration as si:
+                _observability.end_phase(
+                    sessions,
+                    hook_name,
+                    hook_impl,
+                    phase,
+                    phase_starts,
+                    si.value,
+                )
                 result = si.value
                 exception = None
                 continue
             except BaseException as e:
+                _observability.exception_phase(
+                    sessions,
+                    hook_name,
+                    hook_impl,
+                    phase,
+                    phase_starts,
+                    e,
+                )
                 exception = e
                 continue
             _raise_wrapfail(teardown, "has second yield")
+
+        _observability.emit_hook_call_result(
+            sessions, start_times, exception
+        )
+        if token is not None:
+            _observability.reset_parent_call_id(token)
 
     if exception is not None:
         raise exception
     else:
         return result
+

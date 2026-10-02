@@ -48,6 +48,27 @@ API Reference
     :show-inheritance:
     :members:
 
+Implementation observation
+--------------------------
+
+.. autoclass:: pluggy.HookImplObserver()
+    :members:
+
+.. autoclass:: pluggy.HookCallEvent()
+    :members:
+
+.. autoclass:: pluggy.HookCallResultEvent()
+    :members:
+
+.. autoclass:: pluggy.ImplStartEvent()
+    :members:
+
+.. autoclass:: pluggy.ImplEndEvent()
+    :members:
+
+.. autoclass:: pluggy.ImplExceptionEvent()
+    :members:
+
 
 Warnings
 --------
@@ -55,6 +76,9 @@ Warnings
 Custom warnings generated in some situations such as improper usage or deprecated features.
 
 .. autoclass:: pluggy.PluggyWarning()
+    :show-inheritance:
+
+.. autoclass:: pluggy.PluggyObserverWarning()
     :show-inheritance:
 
 .. autoclass:: pluggy.PluggyTeardownRaisedWarning()

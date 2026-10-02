@@ -22,9 +22,18 @@ from ._decorators import HookSpec
 from ._impl import _Plugin
 from ._impl import HookImpl
 
+if TYPE_CHECKING:
+    from ._observability import ObserverEntry
+
 
 _HookExec: TypeAlias = Callable[
-    [str, Sequence[HookImpl], Mapping[str, object], bool],
+    [
+        str,
+        Sequence[HookImpl],
+        Mapping[str, object],
+        bool,
+        Sequence["ObserverEntry"] | None,
+    ],
     object | list[object],
 ]
 

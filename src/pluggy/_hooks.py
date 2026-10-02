@@ -24,6 +24,16 @@ from ._decorators import varnames
 from ._impl import _HookImplFunction
 from ._impl import _Plugin
 from ._impl import HookImpl
+from ._observability import HookImplObserver
+from ._observability import HookCallEvent
+from ._observability import HookCallResultEvent
+from ._observability import ImplEndEvent
+from ._observability import ImplExceptionEvent
+from ._observability import ImplStartEvent
+from ._observability import PHASE_IMPL
+from ._observability import PHASE_WRAPPER_ENTER
+from ._observability import PHASE_WRAPPER_EXIT
+from ._observability import PluggyObserverWarning
 
 
 __all__ = [
@@ -33,8 +43,18 @@ __all__ = [
     "HookSpec",
     "HookimplMarker",
     "HookimplOpts",
+    "HookCallEvent",
+    "HookCallResultEvent",
+    "HookImplObserver",
     "HookspecMarker",
     "HookspecOpts",
+    "ImplEndEvent",
+    "ImplExceptionEvent",
+    "ImplStartEvent",
+    "PHASE_IMPL",
+    "PHASE_WRAPPER_ENTER",
+    "PHASE_WRAPPER_EXIT",
+    "PluggyObserverWarning",
     "_HookCaller",
     "_HookExec",
     "_HookImplFunction",

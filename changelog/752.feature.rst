@@ -1,0 +1,8 @@
+Added an optional implementation-level observer via
+``PluginManager.add_hookimpl_observer``. Unlike hook-level monitoring, it
+reports start, completion and exceptions of each hook implementation that
+actually runs, distinguishing plain implementations from the separate
+``wrapper_enter``/``wrapper_exit`` phases of wrappers, with call ids linking
+nested hook calls. The timing source is injectable, observer failures are
+routed to a diagnostic ``on_observer_error`` channel without affecting plugin
+results, and no event objects are built while observation is disabled.

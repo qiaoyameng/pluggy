@@ -1073,6 +1073,71 @@ The expected signature and default implementations for these functions is:
     def after(outcome, hook_name, hook_impls, kwargs):
         pass
 
+Implementation observation
+--------------------------
+Call monitoring reports only once around an entire hook call, which does not
+reveal *which* implementation or wrapper was slow or raised. For that, register
+an implementation-level observer with
+:py:meth:`pluggy.PluginManager.add_hookimpl_observer()`.
+
+The observer is told about every implementation that actually runs:
+
+* :py:class:`pluggy.ImplStartEvent` when an implementation phase starts,
+* :py:class:`pluggy.ImplEndEvent` when it returns normally,
+* :py:class:`pluggy.ImplExceptionEvent` when it raises,
+* :py:class:`pluggy.HookCallEvent` and
+  :py:class:`pluggy.HookCallResultEvent` around the overall hook call.
+
+Plain implementations produce a single ``impl`` phase. Wrappers produce two
+distinct phases -- ``wrapper_enter`` (the code before ``yield``) and
+``wrapper_exit`` (the code after ``yield``) -- so time spent setting up is
+reported separately from time spent tearing down. Every event carries the
+``call_id`` of the hook call it belongs to; a hook call made from inside an
+implementation reports the enclosing id as ``parent_call_id``.
+
+An injected ``clock`` (a zero-argument callable returning timestamps) lets you
+measure durations deterministically. Implementations that never run -- for
+example those skipped after a ``firstresult`` hook got its result -- are not
+reported.
+
+Events are delivered as they happen; pluggy never accumulates an event list,
+and with no observer installed no event objects are created. If an observer
+method raises, the error is routed to
+:py:meth:`pluggy.HookImplObserver.on_observer_error` (a
+:py:class:`pluggy.PluggyObserverWarning` by default) instead of propagating, so
+observer failures can never replace a plugin's own exception or alter a hook
+call's result.
+
+.. code-block:: python
+
+    import time
+
+
+    class TimingObserver:
+        def __init__(self):
+            self.spans = []
+
+        def on_impl_end(self, event):
+            self.spans.append(
+                (
+                    event.hook_name,
+                    event.impl.plugin_name,
+                    event.phase,
+                    event.end_time - event.start_time,
+                )
+            )
+
+        def on_impl_exception(self, event):
+            self.spans.append(
+                (event.hook_name, event.impl.plugin_name, "error", str(event.exception))
+            )
+
+
+    observer = TimingObserver()
+    undo = pm.add_hookimpl_observer(observer, clock=time.perf_counter)
+    # ... run hooks ...
+    undo()
+
 Public API
 **********
 Please see the :doc:`api_reference`.
