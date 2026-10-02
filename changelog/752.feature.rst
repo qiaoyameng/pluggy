@@ -1,0 +1,4 @@
+Added :meth:`pluggy.PluginManager.select_hook_caller`, which returns a read-only, call-scoped :class:`~pluggy.HookCaller` view that invokes only the plugins registered under the given names.
+This lets several callers (for example tenants) share one ``PluginManager`` while each call involves a different set of plugins, without unregistering anything or mutating the shared hook-implementation list.
+The selection is a snapshot taken when the view is built, so plugins registered or unregistered afterwards cannot change which implementations the view invokes; unknown and blocked plugin names raise ``KeyError``.
+For historic hooks, ``call_historic`` on the view records view-local history that never replays for later registrations.

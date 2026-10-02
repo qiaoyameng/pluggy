@@ -1034,6 +1034,47 @@ to make normal, :py:meth:`~pluggy.HookCaller.call_historic`, or
 :py:meth:`~pluggy.HookCaller.call_extra` calls as necessary.
 
 
+.. _selecting:
+
+Selecting plugins per call (multi-tenant)
+-----------------------------------------
+Sometimes a single :py:class:`~pluggy.PluginManager` is shared between
+several callers (for example tenants) that each have their own plugins
+registered, and a given call must involve only one caller's plugins.
+
+:py:meth:`pluggy.PluginManager.select_hook_caller` returns a *read-only*
+:py:class:`~pluggy.HookCaller` view of a hook that invokes only the plugins
+registered under the names you pass:
+
+.. code-block:: python
+
+    tenant_a_hook = pm.select_hook_caller("my_hook", ["tenant_a_plugin"])
+    result = tenant_a_hook(arg=value)
+
+The selection is purely call-scoped:
+
+* nothing is unregistered, and the manager's hook-implementation list is
+  never modified -- other callers and the ``pm.hook`` relay keep working with
+  every plugin;
+* only plugins *registered and selected when the view is built* participate.
+  Registering, unregistering or blocking a plugin afterwards cannot grow or
+  shrink the view, so one caller's selection can never be widened by a later
+  registration;
+* relative ordering is taken from the full hook chain, so ``tryfirst``/
+  ``trylast``, wrappers and ``firstresult`` behave exactly as they do for the
+  filtered chain. A wrapper only runs if its plugin is selected, and then it
+  wraps just the other selected implementations.
+
+Unknown hook names, and plugin names that are unknown or :py:meth:`blocked
+<pluggy.PluginManager.set_blocked>`, raise ``KeyError``.
+
+For a :ref:`historic <historic>` hook, calling
+:py:meth:`~pluggy.HookCaller.call_historic` on the view is supported, but the
+recorded call (its ``kwargs`` and ``result_callback``) is kept *local to the
+view*. It replays for the selected plugins only and is never shared with the
+manager's hook caller, so plugins registered later do not receive it.
+
+
 .. _tracing:
 
 Built-in tracing

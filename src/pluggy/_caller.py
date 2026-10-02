@@ -320,3 +320,77 @@ class _SubsetHookCaller(HookCaller):
 
     def __repr__(self) -> str:
         return f"<_SubsetHookCaller {self.name!r}>"
+
+
+class _SelectHookCaller(HookCaller):
+    """A read-only proxy to another :class:`HookCaller` that only invokes the
+    implementations provided by a fixed, frozen set of *included plugins*.
+
+    Unlike :class:`_SubsetHookCaller`, the set of participating plugins is a
+    snapshot taken when the view is built: plugins registered or unregistered
+    afterwards never change which implementations this view invokes. This lets
+    several callers (for example tenants sharing one
+    :class:`~pluggy.PluginManager`) each issue a call scoped to its own
+    plugins, without unregistering anyone else's.
+    """
+
+    # Same proxy idea as `_SubsetHookCaller`: the *code* is inherited from
+    # `HookCaller` while the underlying *data* is delegated to the original
+    # caller. `_call_history` is the one deliberate exception -- it is private
+    # to this view, so a historic call made through it can never leak into the
+    # original caller's history and replay for plugins registered later.
+
+    __slots__ = (
+        "_orig",
+        "_included_plugins",
+        "_view_call_history",
+    )
+
+    def __init__(
+        self, orig: HookCaller, included_plugins: AbstractSet[_Plugin]
+    ) -> None:
+        self._orig = orig
+        # Freeze the selection. A later registration must not be able to grow
+        # this view simply by mutating the iterable handed in by the caller.
+        self._included_plugins: Final[AbstractSet[_Plugin]] = frozenset(
+            included_plugins
+        )
+        self.name = orig.name  # type: ignore[misc]
+        self._hookexec = orig._hookexec  # type: ignore[misc]
+        # View-local historic history: records the ``(kwargs,
+        # result_callback)`` of historic calls issued through this view. It is
+        # deliberately not shared with the original caller, and because the
+        # participating plugins are a frozen snapshot there is never a newly
+        # registered plugin to replay it for -- the view cannot grow.
+        self._view_call_history: Final[_CallHistory | None] = (
+            [] if orig.is_historic() else None
+        )
+
+    @property  # type: ignore[misc]
+    def _hookimpls(self) -> list[HookImpl]:
+        # Snapshot semantics: read the original's current chain, keeping only
+        # implementations whose plugin object belongs to the frozen selection.
+        # Plugins registered later are absent from `_included_plugins`, and
+        # plugins unregistered later are absent from the original chain, so in
+        # neither case can the view silently grow or shrink beyond the frozen
+        # selection. Ordering (and therefore tryfirst/trylast, wrappers and
+        # firstresult behaviour) is taken unchanged from the filtered chain.
+        return [
+            impl
+            for impl in self._orig._hookimpls
+            if impl.plugin in self._included_plugins
+        ]
+
+    @property
+    def spec(self) -> HookSpec | None:  # type: ignore[override]
+        return self._orig.spec
+
+    @property  # type: ignore[misc]
+    def _call_history(self) -> _CallHistory | None:
+        return self._view_call_history
+
+    def is_historic(self) -> bool:
+        return self._orig.is_historic()
+
+    def __repr__(self) -> str:
+        return f"<_SelectHookCaller {self.name!r}>"

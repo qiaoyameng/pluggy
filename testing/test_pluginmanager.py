@@ -811,6 +811,269 @@ def test_subset_hook_caller_with_specname(pm: PluginManager) -> None:
     assert hc() == [2]
 
 
+def test_select_hook_caller_basic(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self, arg):
+            pass
+
+    pm.add_hookspecs(Hooks)
+
+    out: list[str] = []
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(f"p1:{arg}")
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(f"p2:{arg}")
+
+    p1, p2 = Plugin1(), Plugin2()
+    pm.register(p1, name="p1")
+    pm.register(p2, name="p2")
+
+    only1 = pm.select_hook_caller("he_method1", ["p1"])
+    only1(arg=1)
+    assert out == ["p1:1"]
+    out.clear()
+
+    both = pm.select_hook_caller("he_method1", ["p2", "p1"])
+    both(arg=2)
+    # Selection order is irrelevant: execution follows the hook chain order.
+    assert out == ["p2:2", "p1:2"]
+    out.clear()
+
+    # The shared manager is untouched: it still calls every plugin.
+    pm.hook.he_method1(arg=3)
+    assert out == ["p2:3", "p1:3"]
+
+
+def test_select_hook_caller_unknown_and_blocked(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self, arg):
+            pass
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self):
+            pass
+
+    pm.register(Plugin1(), name="p1")
+    pm.set_blocked("blocked")
+
+    # Unknown hook name.
+    with pytest.raises(KeyError, match="no hook named"):
+        pm.select_hook_caller("does_not_exist", ["p1"])
+
+    # Never-registered plugin name.
+    with pytest.raises(KeyError, match="'ghost'"):
+        pm.select_hook_caller("he_method1", ["ghost"])
+
+    # Blocked name (present in the registry only as the None sentinel).
+    with pytest.raises(KeyError, match="'blocked'"):
+        pm.select_hook_caller("he_method1", ["blocked"])
+
+    # The whole selection is rejected, not partially applied.
+    with pytest.raises(KeyError):
+        pm.select_hook_caller("he_method1", ["p1", "ghost", "blocked"])
+
+
+def test_select_hook_caller_is_snapshot(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self, arg):
+            pass
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg + 1
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg + 100
+
+    pm.register(Plugin1(), name="p1")
+
+    view = pm.select_hook_caller("he_method1", ["p1"])
+    assert view(arg=1) == [2]
+
+    # Registering later must not widen a previously built view.
+    pm.register(Plugin2(), name="p2")
+    assert view(arg=1) == [2]
+    assert pm.hook.he_method1(arg=1) == [101, 2]
+
+    # Unregistering a selected plugin only removes it from the live chain;
+    # it cannot cause some other plugin to slip into the frozen view.
+    pm.unregister(name="p1")
+    assert view(arg=1) == []
+    assert pm.hook.he_method1(arg=1) == [101]
+
+
+def test_select_hook_caller_firstresult_order(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(firstresult=True)
+        def he_method1(self, arg):
+            pass
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl(tryfirst=True)
+        def he_method1(self, arg):
+            return "first"
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self, arg):
+            return "second"
+
+    pm.register(Plugin1(), name="p1")
+    pm.register(Plugin2(), name="p2")
+
+    # Filtered chain keeps tryfirst ordering, so firstresult still hits p1.
+    view = pm.select_hook_caller("he_method1", ["p1", "p2"])
+    assert view(arg=1) == "first"
+
+    # Removing the tryfirst plugin promotes p2 for firstresult.
+    only2 = pm.select_hook_caller("he_method1", ["p2"])
+    assert only2(arg=1) == "second"
+
+
+def test_select_hook_caller_wrappers_scoped(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(firstresult=True)
+        def he_method1(self, arg):
+            pass
+
+    pm.add_hookspecs(Hooks)
+
+    class Plain:
+        @hookimpl
+        def he_method1(self, arg):
+            return f"plain:{arg}"
+
+    class Wrap:
+        @hookimpl(wrapper=True)
+        def he_method1(self, arg):
+            result = yield
+            return f"wrap({result})"
+
+    pm.register(Plain(), name="plain")
+    pm.register(Wrap(), name="wrap")
+
+    assert pm.hook.he_method1(arg=1) == "wrap(plain:1)"
+
+    # A view without the wrapper runs the plain implementation unwrapped.
+    no_wrap = pm.select_hook_caller("he_method1", ["plain"])
+    assert no_wrap(arg=2) == "plain:2"
+
+    # A view with the wrapper but no inner implementation gets None wrapped.
+    only_wrap = pm.select_hook_caller("he_method1", ["wrap"])
+    assert only_wrap(arg=3) == "wrap(None)"
+
+    # The wrapper wraps exactly the selected implementations.
+    both = pm.select_hook_caller("he_method1", ["wrap", "plain"])
+    assert both(arg=4) == "wrap(plain:4)"
+
+
+def test_select_hook_caller_historic_is_view_local(pm: PluginManager) -> None:
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin1:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg * 10
+
+    pm.register(Plugin1(), name="p1")
+
+    view = pm.select_hook_caller("he_method1", ["p1"])
+    view_out: list[object] = []
+    view.call_historic(
+        result_callback=view_out.append, kwargs={"arg": 2}
+    )
+    assert view_out == [2]
+
+    # A plugin registered after the view's historic call is not replayed into
+    # the view, so a tenant selection cannot grow via later registration.
+    pm.register(Plugin2(), name="p2")
+    assert view_out == [2]
+
+    # The view-local history is isolated from the manager's hook caller.
+    assert pm.hook.he_method1._call_history == []
+    assert view._call_history is not pm.hook.he_method1._call_history
+
+
+def test_select_hook_caller_nested_call_does_not_affect_outer(
+    pm: PluginManager,
+) -> None:
+    class Hooks:
+        @hookspec
+        def he_method1(self, arg):
+            pass
+
+    pm.add_hookspecs(Hooks)
+
+    order: list[str] = []
+
+    class Plugin1:
+        @hookimpl(tryfirst=True)
+        def he_method1(self, arg):
+            order.append(f"p1:{arg}")
+            if arg == 0:
+                # Nested, differently-scoped selection during the outer call.
+                other = pm.select_hook_caller("he_method1", ["p3"])
+                assert other(arg=99) == ["p3:99"]
+            return f"p1:{arg}"
+
+    class Plugin2:
+        @hookimpl
+        def he_method1(self, arg):
+            order.append(f"p2:{arg}")
+            return f"p2:{arg}"
+
+    class Plugin3:
+        @hookimpl
+        def he_method1(self, arg):
+            order.append(f"p3:{arg}")
+            return f"p3:{arg}"
+
+    pm.register(Plugin1(), name="p1")
+    pm.register(Plugin2(), name="p2")
+    pm.register(Plugin3(), name="p3")
+
+    chain_before = [impl.plugin_name for impl in pm.hook.he_method1.get_hookimpls()]
+
+    outer = pm.select_hook_caller("he_method1", ["p1", "p2"])
+    assert outer(arg=0) == ["p1:0", "p2:0"]
+
+    # p3 ran only inside the nested view, interleaved in the trace order.
+    assert order == ["p1:0", "p3:99", "p2:0"]
+
+    # Neither the shared implementation list nor the outer view changed.
+    chain_after = [impl.plugin_name for impl in pm.hook.he_method1.get_hookimpls()]
+    assert chain_after == chain_before
+    assert outer(arg=1) == ["p1:1", "p2:1"]
+
+
 def test_get_hookimpls(pm: PluginManager) -> None:
     class Hooks:
         @hookspec

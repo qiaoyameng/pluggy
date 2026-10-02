@@ -19,6 +19,7 @@ from ._compat import DistFacade
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
 from ._hooks import _Plugin
+from ._hooks import _SelectHookCaller
 from ._hooks import _SubsetHookCaller
 from ._hooks import HookCaller
 from ._hooks import HookImpl
@@ -631,6 +632,71 @@ class PluginManager:
         if not plugins_to_remove:
             return orig
         return _SubsetHookCaller(orig, plugins_to_remove)
+
+    def select_hook_caller(
+        self, name: str, plugin_names: Iterable[str]
+    ) -> HookCaller:
+        """Return a read-only :class:`~pluggy.HookCaller` view of the ``name``
+        hook scoped to the plugins registered under ``plugin_names``.
+
+        This is a *call-level* selection aimed at sharing one
+        :class:`PluginManager` between several callers (for example tenants),
+        where each call may involve a different set of plugins:
+
+        * It does **not** unregister anything -- the returned view is a proxy
+          over the live caller, and the shared hook-implementation list is
+          never modified.
+        * The selection is a *snapshot*. Only plugins registered and selected
+          at the moment the view is built ever participate, and they keep the
+          relative order they have in the full hook chain (so
+          ``tryfirst``/``trylast``, wrappers and ``firstresult`` behave
+          exactly as they do for the filtered chain). Registering,
+          unregistering or blocking a plugin afterwards neither grows nor
+          shrinks the view.
+
+        :param name:
+            Name of the hook to select. It must already exist as a hook
+            caller, otherwise :exc:`KeyError` is raised.
+
+        :param plugin_names:
+            Registered plugin names to include. Unknown names and *blocked*
+            names raise :exc:`KeyError` -- a blocked or never-registered name
+            cannot possibly participate. Duplicate names are ignored. Names of
+            registered plugins that simply do not implement ``name`` are
+            allowed and contribute nothing.
+
+        :returns:
+            A :class:`~pluggy.HookCaller` proxy. ``wrapper``/``hookwrapper``
+            implementations belonging to a selected plugin are included and
+            wrap exactly the other selected implementations; wrappers of
+            plugins that were *not* selected do not run. For a
+            :ref:`historic <historic>` hook, :meth:`~pluggy.HookCaller.
+            call_historic` is supported but is view-local: the call and its
+            ``result_callback`` are recorded on the view only and replay for
+            the selected plugins -- never for plugins registered later, so a
+            tenant's selection can never be widened by a subsequent
+            registration.
+        """
+        orig: HookCaller | None = getattr(self.hook, name, None)
+        if orig is None:
+            raise KeyError(f"no hook named {name!r}")
+
+        included_plugins: set[_Plugin] = set()
+        unknown: list[str] = []
+        for plugin_name in plugin_names:
+            plugin = self._name2plugin.get(plugin_name, _ABSENT)
+            if plugin is _ABSENT or plugin is None:
+                # Missing entirely, or present only as a blocked-name
+                # sentinel (``None``): neither can participate.
+                unknown.append(plugin_name)
+                continue
+            included_plugins.add(plugin)
+        if unknown:
+            raise KeyError(
+                "unknown or blocked plugin name(s): " + ", ".join(map(repr, unknown))
+            )
+
+        return _SelectHookCaller(orig, included_plugins)
 
 
 def _formatdef(func: Callable[..., object]) -> str:

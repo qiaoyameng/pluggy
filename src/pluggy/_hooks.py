@@ -10,6 +10,7 @@ from __future__ import annotations
 from ._caller import _HookCaller
 from ._caller import _HookExec
 from ._caller import _HookRelay
+from ._caller import _SelectHookCaller
 from ._caller import _SubsetHookCaller
 from ._caller import HookCaller
 from ._caller import HookRelay
@@ -41,6 +42,7 @@ __all__ = [
     "_HookRelay",
     "_Namespace",
     "_Plugin",
+    "_SelectHookCaller",
     "_SubsetHookCaller",
     "normalize_hookimpl_opts",
     "varnames",
