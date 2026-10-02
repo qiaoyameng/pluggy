@@ -518,8 +518,9 @@ This can be helpful if the host application evolved the hookspec to add a new
 argument, but the plugin still wants to support an old version of the host
 application which didn't pass this argument.
 
-If the hook caller passes a value for the parameter, it is used. Otherwise the
-default declared by the hookimpl is used.
+An explicitly passed hook call value takes precedence, followed by a default
+declared by the hookspec. If neither supplies the parameter, the default
+declared by the hookimpl is used.
 
 .. versionchanged:: 1.7
     Previous versions had a different, unhelpful, behavior of *always* using the
@@ -595,11 +596,11 @@ To allow for *hookspecs* to evolve over the lifetime of a project,
 This allows for extending hook arguments (and thus semantics) without
 breaking existing *hookimpls*.
 
-Only arguments without default values are considered for this opt-in
-matching. Arguments with defaults in a *hookimpl* are treated as optional
-keyword arguments and are not passed by pluggy, even when the hook caller
-provides a value with the same name. If a *hookimpl* needs a value from the
-hook call, declare it without a default value.
+Pluggy binds hook call arguments to a *hookimpl* by parameter name. A
+*hookimpl* may omit arguments declared by the *hookspec*, and parameters which
+the *hookimpl* declares with a default value remain optional for old hook
+callers. Explicitly passed values and *hookspec* defaults take precedence over
+a *hookimpl*'s own default value.
 
 In other words this is ok:
 
@@ -647,7 +648,9 @@ while keeping existing *hookimpls* working, it doesn't help with existing *hook
 callers*. To handle this, pluggy allows a hookspec to declare a default value
 for an argument, using the usual ``def myhook(new_arg="default")`` Python syntax.
 
-If a caller omits this argument, pluggy will supply the default to the hookimpls.
+If a caller omits this argument, pluggy will supply the default to hookimpls
+which accept it. Passing ``None`` explicitly is distinct from omitting the
+argument and binds the parameter to ``None``.
 This allows the hookspec to add the new argument without breaking existing
 callers:
 
@@ -662,6 +665,10 @@ callers:
     pm.hook.myhook(config=config, args=args)
     # New caller; hookimpls will get new_arg="get this".
     pm.hook.myhook(config=config, args=args, new_arg="get this")
+
+Hookimpls which do not declare ``new_arg`` are not given it. Keyword-only
+parameters and ``**kwargs`` use the same binding rules as ordinary
+positional-or-keyword parameters.
 
 .. versionadded:: 1.7
     Hookspec argument defaults.

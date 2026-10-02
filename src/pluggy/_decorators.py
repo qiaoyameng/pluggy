@@ -27,6 +27,69 @@ _Namespace: TypeAlias = ModuleType | type
 
 
 @final
+class HookParameters:
+    """Analyzed parameters of a hook function or hook specification."""
+
+    __slots__ = (
+        "argdefaults",
+        "explicit_argnames",
+        "kwonly_argdefaults",
+        "kwonly_argnames",
+        "kwonly_kwargnames",
+        "positional_only_argnames",
+        "positional_kwargnames",
+        "positional_argnames",
+        "var_keyword",
+    )
+
+    def __init__(
+        self,
+        positional_argnames: tuple[str, ...],
+        positional_kwargnames: tuple[str, ...],
+        positional_only_argnames: tuple[str, ...],
+        kwonly_argnames: tuple[str, ...],
+        kwonly_kwargnames: tuple[str, ...],
+        argdefaults: Mapping[str, object],
+        kwonly_argdefaults: Mapping[str, object],
+        var_keyword: bool,
+    ) -> None:
+        explicit_argnames = frozenset(
+            positional_argnames
+            + positional_kwargnames
+            + kwonly_argnames
+            + kwonly_kwargnames
+        )
+        self.positional_argnames: Final = positional_argnames
+        self.positional_kwargnames: Final = positional_kwargnames
+        self.positional_only_argnames: Final = positional_only_argnames
+        self.kwonly_argnames: Final = kwonly_argnames
+        self.kwonly_kwargnames: Final = kwonly_kwargnames
+        self.argdefaults: Final[Mapping[str, object]] = dict(argdefaults)
+        self.kwonly_argdefaults: Final[Mapping[str, object]] = dict(
+            kwonly_argdefaults
+        )
+        self.var_keyword: Final = var_keyword
+        self.explicit_argnames: Final[frozenset[str]] = explicit_argnames
+
+    @property
+    def argnames(self) -> tuple[str, ...]:
+        return self.positional_argnames + self.kwonly_argnames
+
+    @property
+    def kwargnames(self) -> tuple[str, ...]:
+        return self.positional_kwargnames + self.kwonly_kwargnames
+
+    @property
+    def all_argnames(self) -> tuple[str, ...]:
+        return (
+            self.positional_argnames
+            + self.positional_kwargnames
+            + self.kwonly_argnames
+            + self.kwonly_kwargnames
+        )
+
+
+@final
 class HookspecMarker:
     """Decorator for marking functions as hook specifications.
 
@@ -244,6 +307,100 @@ _NOSELF_WARN_SUPPRESS: frozenset[str] = frozenset(
     }
 )
 
+_CO_VARKEYWORDS = inspect.CO_VARKEYWORDS
+
+
+def hook_parameters(
+    func: object, *, legacy_noself: bool = False
+) -> HookParameters:
+    """Return bindable hook parameters without resolving annotations."""
+    is_bound = False
+    if inspect.isclass(func):
+        try:
+            func = func.__init__
+        except AttributeError:  # pragma: no cover - pypy special case
+            func = None
+        is_bound = True
+    elif not inspect.isroutine(func):
+        try:
+            func = getattr(func, "__call__", func)  # noqa: B004
+        except Exception:  # pragma: no cover - pypy special case
+            func = None
+    if func is not None:
+        if inspect.ismethod(func):
+            is_bound = True
+        unwrapped = inspect.unwrap(func)
+        if inspect.ismethod(unwrapped):
+            is_bound = True
+            unwrapped = unwrapped.__func__
+        func = unwrapped
+
+    if func is None:
+        return HookParameters((), (), (), (), (), {}, {}, False)
+
+    try:
+        code = func.__code__
+        defaults = func.__defaults__
+        kwdefaults = func.__kwdefaults__
+        qualname = func.__qualname__
+        if not isinstance(code, types.CodeType):
+            raise AttributeError("hook function without a code object")
+    except AttributeError:  # pragma: no cover
+        return HookParameters((), (), (), (), (), {}, {}, False)
+
+    positional = tuple(code.co_varnames[: code.co_argcount])
+    tail = qualname.rsplit("<locals>.", maxsplit=1)[-1]
+    is_class_method = "." in tail
+    if positional:
+        if is_bound or (is_class_method and positional[0] in _IMPLICIT_NAMES):
+            positional = positional[1:]
+        elif (
+            is_class_method
+            and legacy_noself
+            and tail not in _NOSELF_WARN_SUPPRESS
+        ):
+            warnings.warn(
+                f"{qualname} is a method but its first parameter"
+                f" {positional[0]!r} is not 'self'."
+                f" Add 'self' as the first parameter or use @staticmethod."
+                f" This will become an error in a future version of pluggy.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+
+    positional_only_count = code.co_posonlyargcount
+    positional_only = positional[:positional_only_count]
+
+    if defaults:
+        default_index = -len(defaults)
+        positional_required = positional[:default_index]
+        positional_optional = positional[default_index:]
+        positional_defaults = dict(zip(positional_optional, defaults))
+    else:
+        positional_required = positional
+        positional_optional = ()
+        positional_defaults = {}
+
+    kwonly = tuple(
+        code.co_varnames[
+            code.co_argcount : code.co_argcount + code.co_kwonlyargcount
+        ]
+    )
+    kwonly_defaults = kwdefaults or {}
+    kwonly_required = tuple(name for name in kwonly if name not in kwonly_defaults)
+    kwonly_optional = tuple(name for name in kwonly if name in kwonly_defaults)
+
+    return HookParameters(
+        positional_required,
+        positional_optional,
+        positional_only,
+        kwonly_required,
+        kwonly_optional,
+        positional_defaults,
+        kwonly_defaults,
+        bool(code.co_flags & _CO_VARKEYWORDS),
+    )
+
 
 def varnames(
     func: object, *, legacy_noself: bool = False
@@ -261,68 +418,11 @@ def varnames(
         When the function looks like a class method but has no implicit first
         parameter, a :class:`DeprecationWarning` is emitted.
     """
-    is_bound = False
-    if inspect.isclass(func):
-        try:
-            func = func.__init__
-        except AttributeError:  # pragma: no cover - pypy special case
-            return (), ()
-        is_bound = True
-    elif not inspect.isroutine(func):  # callable object?
-        try:
-            # Not a `callable()` check: the `__call__` attribute itself is
-            # wanted, so that its signature can be inspected below.
-            func = getattr(func, "__call__", func)  # noqa: B004
-        except Exception:  # pragma: no cover - pypy special case
-            return (), ()
-
-    # Track bound methods before unwrapping, since __func__ loses that info.
-    if inspect.ismethod(func):
-        is_bound = True
-    func = inspect.unwrap(func)  # type: ignore[arg-type]
-    if inspect.ismethod(func):
-        is_bound = True
-        func = func.__func__
-
-    try:
-        code: types.CodeType = func.__code__  # type: ignore[attr-defined]
-        defaults: tuple[object, ...] | None = func.__defaults__  # type: ignore[attr-defined]
-        qualname: str = func.__qualname__  # type: ignore[attr-defined]
-    except AttributeError:  # pragma: no cover
-        return (), ()
-
-    # Get positional argument names (positional-only + positional-or-keyword)
-    args: tuple[str, ...] = code.co_varnames[: code.co_argcount]
-
-    # Determine which args have defaults
-    kwargs: tuple[str, ...]
-    if defaults:
-        index = -len(defaults)
-        args, kwargs = args[:index], args[index:]
-    else:
-        kwargs = ()
-
-    # Strip implicit instance/class arg.
-    # Check if this looks like a method defined in a class by examining the
-    # qualname after the last "<locals>." segment (if any). A remaining dot
-    # means it's a class method (e.g. "MyClass.method" or
-    # "func.<locals>.MyClass.method"), not just a nested function.
-    _tail = qualname.rsplit("<locals>.", maxsplit=1)[-1]
-    _is_class_method = "." in _tail
-    if args:
-        if is_bound or (_is_class_method and args[0] in _IMPLICIT_NAMES):
-            args = args[1:]
-        elif _is_class_method and legacy_noself and _tail not in _NOSELF_WARN_SUPPRESS:
-            warnings.warn(
-                f"{qualname} is a method but its first parameter"
-                f" {args[0]!r} is not 'self'."
-                f" Add 'self' as the first parameter or use @staticmethod."
-                f" This will become an error in a future version of pluggy.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-    return args, kwargs
+    parameters = hook_parameters(func, legacy_noself=legacy_noself)
+    return (
+        parameters.positional_argnames,
+        parameters.positional_kwargnames,
+    )
 
 
 @final
@@ -330,11 +430,16 @@ class HookSpec:
     __slots__ = (
         "argnames",
         "function",
+        "kwonly_argnames",
+        "kwonly_kwargnames",
         "kwargdefaults",
         "kwargnames",
         "name",
         "namespace",
         "opts",
+        "parameters",
+        "positional_argnames",
+        "var_keyword",
         "warn_on_impl",
         "warn_on_impl_args",
     )
@@ -346,11 +451,27 @@ class HookSpec:
         legacy_noself = inspect.isclass(namespace) and not isinstance(
             inspect.getattr_static(namespace, name), staticmethod
         )
-        self.argnames, self.kwargnames = varnames(
+        self.parameters = hook_parameters(
             self.function, legacy_noself=legacy_noself
         )
-        defaults = inspect.unwrap(self.function).__defaults__
-        self.kwargdefaults = dict(zip(self.kwargnames, defaults or ()))
+        self.argnames = self.parameters.argnames
+        self.kwargnames = self.parameters.kwargnames
+        self.positional_argnames = (
+            self.parameters.positional_argnames
+            + self.parameters.positional_kwargnames
+        )
+        self.kwonly_argnames = self.parameters.kwonly_argnames
+        self.kwonly_kwargnames = self.parameters.kwonly_kwargnames
+        self.kwargdefaults = {
+            **self.parameters.argdefaults,
+            **self.parameters.kwonly_argdefaults,
+        }
+        self.var_keyword = self.parameters.var_keyword
+        if self.parameters.positional_only_argnames:
+            raise ValueError(
+                "Positional-only arguments are not supported in hook "
+                "specifications because hook arguments are bound by name"
+            )
         self.opts = opts
         self.warn_on_impl = opts.get("warn_on_impl")
         self.warn_on_impl_args = opts.get("warn_on_impl_args")

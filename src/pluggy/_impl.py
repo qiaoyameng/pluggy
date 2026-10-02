@@ -12,7 +12,7 @@ from typing import TypeAlias
 from typing import TypeVar
 
 from ._config import HookimplOpts
-from ._decorators import varnames
+from ._decorators import hook_parameters
 from ._result import Result
 
 
@@ -30,13 +30,19 @@ class HookImpl:
         "argnames",
         "function",
         "hookwrapper",
+        "kwonly_argnames",
+        "kwonly_kwargnames",
         "kwargnames",
         "optionalhook",
         "opts",
+        "parameters",
         "plugin",
         "plugin_name",
+        "positional_only_argnames",
+        "positional_argnames",
         "tryfirst",
         "trylast",
+        "var_keyword",
         "wrapper",
     )
 
@@ -50,12 +56,21 @@ class HookImpl:
         """:meta private:"""
         #: The hook implementation function.
         self.function: Final = function
-        argnames, kwargnames = varnames(self.function)
+        parameters = hook_parameters(self.function)
+        self.parameters: Final = parameters
         #: The positional parameter names of ``function``.
-        self.argnames: Final = argnames
-        #: The keyword parameter names of ``function`` which declare defaults.
-        #: Keyword-only parameters are *not* included.
-        self.kwargnames: Final = kwargnames
+        self.positional_argnames: Final = (
+            parameters.positional_argnames + parameters.positional_kwargnames
+        )
+        self.positional_only_argnames: Final = (
+            parameters.positional_only_argnames
+        )
+        self.argnames: Final = parameters.argnames
+        #: The positional-or-keyword parameters of ``function`` with defaults.
+        self.kwargnames: Final = parameters.kwargnames
+        self.kwonly_argnames: Final = parameters.kwonly_argnames
+        self.kwonly_kwargnames: Final = parameters.kwonly_kwargnames
+        self.var_keyword: Final = parameters.var_keyword
         #: The plugin which defined this hook implementation.
         self.plugin: Final = plugin
         #: The :class:`HookimplOpts` used to configure this hook implementation.

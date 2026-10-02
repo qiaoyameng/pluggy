@@ -425,10 +425,17 @@ class PluginManager:
         if hook.spec.warn_on_impl:
             _warn_for_function(hook.spec.warn_on_impl, hookimpl.function)
 
-        # positional arg checking
-        notinspec = set(hookimpl.argnames) - (
-            set(hook.spec.argnames) | set(hook.spec.kwargnames)
-        )
+        if hookimpl.positional_only_argnames:
+            raise PluginValidationError(
+                hookimpl.plugin,
+                f"Plugin {hookimpl.plugin_name!r} for hook {hook.name!r}\n"
+                f"hookimpl definition: {_formatdef(hookimpl.function)}\n"
+                "Positional-only arguments are not supported because hook "
+                "arguments are bound by name",
+            )
+
+        spec_argnames = set(hook.spec.parameters.all_argnames)
+        notinspec = set(hookimpl.argnames) - spec_argnames
         if notinspec:
             raise PluginValidationError(
                 hookimpl.plugin,
@@ -439,7 +446,7 @@ class PluginManager:
             )
 
         if hook.spec.warn_on_impl_args:
-            for hookimpl_argname in hookimpl.argnames + hookimpl.kwargnames:
+            for hookimpl_argname in hookimpl.parameters.all_argnames:
                 argname_warning = hook.spec.warn_on_impl_args.get(hookimpl_argname)
                 if argname_warning is not None:
                     _warn_for_function(argname_warning, hookimpl.function)

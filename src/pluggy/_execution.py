@@ -104,33 +104,51 @@ def _multicall(
     try:  # run impl and wrapper setup functions in a loop
         for hook_impl in reversed(hook_impls):
             try:
-                args = [caller_kwargs[argname] for argname in hook_impl.argnames]
-                if hook_impl.kwargnames:
-                    kwargs = {
-                        argname: caller_kwargs[argname]
-                        for argname in hook_impl.kwargnames
-                        if argname in caller_kwargs
-                    } or None
-                else:
-                    kwargs = None
+                args: list[object] = []
+                for argname in hook_impl.positional_argnames:
+                    if argname in caller_kwargs:
+                        args.append(caller_kwargs[argname])
+                    elif argname in hook_impl.parameters.argdefaults:
+                        args.append(hook_impl.parameters.argdefaults[argname])
+                    else:
+                        raise HookCallError(
+                            f"hook call must provide argument {argname!r}"
+                        )
+
+                kwargs = {
+                    argname: caller_kwargs[argname]
+                    for argname in (
+                        hook_impl.kwonly_argnames + hook_impl.kwonly_kwargnames
+                    )
+                    if argname in caller_kwargs
+                }
+                if hook_impl.var_keyword:
+                    kwargs.update(
+                        {
+                            argname: value
+                            for argname, value in caller_kwargs.items()
+                            if argname not in hook_impl.parameters.explicit_argnames
+                        }
+                    )
+                call_kwargs = kwargs or None
             except KeyError as e:
                 raise HookCallError(
                     f"hook call must provide argument {e.args[0]!r}"
-                ) from e
+                ) from None
 
             if hook_impl.hookwrapper:
                 function_gen = run_old_style_hookwrapper(
-                    hook_impl, hook_name, args, kwargs
+                    hook_impl, hook_name, args, call_kwargs
                 )
 
                 next(function_gen)  # first yield
                 teardowns.append(function_gen)
 
             elif hook_impl.wrapper:
-                if kwargs is None:
+                if call_kwargs is None:
                     res = hook_impl.function(*args)
                 else:
-                    res = hook_impl.function(*args, **kwargs)
+                    res = hook_impl.function(*args, **call_kwargs)
                 # If this cast is not valid, a type error is raised below,
                 # which is the desired response.
                 if TYPE_CHECKING:
@@ -143,10 +161,10 @@ def _multicall(
                     _raise_wrapfail(function_gen, "did not yield")
                 teardowns.append(function_gen)
             else:
-                if kwargs is None:
+                if call_kwargs is None:
                     res = hook_impl.function(*args)
                 else:
-                    res = hook_impl.function(*args, **kwargs)
+                    res = hook_impl.function(*args, **call_kwargs)
                 if res is not None:
                     results.append(res)
                     if firstresult:  # halt further impl calls

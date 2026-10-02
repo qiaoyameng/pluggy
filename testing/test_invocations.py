@@ -597,6 +597,38 @@ class TestHookspecDefaultArgumentValue:
 
         assert seen == [(1, "spec"), (2, "call")]
 
+    def test_historic_replay_explicit_binding(self, pm: PluginManager) -> None:
+        class Api:
+            @hookspec(historic=True)
+            def hello(self, arg, new_arg="spec"):
+                pass
+
+        pm.add_hookspecs(Api)
+        pm.hook.hello.call_historic(kwargs={"arg": 1})
+        pm.hook.hello.call_historic(kwargs={"arg": 2, "new_arg": None})
+
+        seen = []
+
+        class OldPlugin:
+            @hookimpl
+            def hello(self, arg):
+                seen.append(("old", arg))
+
+        class NewPlugin:
+            @hookimpl
+            def hello(self, arg, new_arg):
+                seen.append(("new", arg, new_arg))
+
+        pm.register(OldPlugin())
+        pm.register(NewPlugin())
+
+        assert seen == [
+            ("old", 1),
+            ("old", 2),
+            ("new", 1, "spec"),
+            ("new", 2, None),
+        ]
+
     def test_call_extra(self, pm: PluginManager) -> None:
         """Test calls with extras respect defaults."""
 
@@ -614,3 +646,166 @@ class TestHookspecDefaultArgumentValue:
         assert pm.hook.hello.call_extra([hello], {"arg": 2, "new_arg": "call"}) == [
             (2, "call")
         ]
+
+    @pytest.mark.parametrize(
+        "wrapper_kind",
+        [
+            pytest.param({"wrapper": True}, id="wrapper"),
+            pytest.param({"hookwrapper": True}, id="hookwrapper"),
+        ],
+    )
+    def test_explicit_binding_for_old_and_new_impls_and_wrapper(
+        self, pm: PluginManager, wrapper_kind: dict[str, bool]
+    ) -> None:
+        class Api:
+            @hookspec
+            def hello(self, arg, new_arg="spec"):
+                pass
+
+        seen = []
+
+        class OldPlugin:
+            @hookimpl
+            def hello(self, arg):
+                seen.append(("old", arg))
+                return "old"
+
+        class NewPlugin:
+            @hookimpl
+            def hello(self, arg, new_arg):
+                seen.append(("new", arg, new_arg))
+                return "new"
+
+        class DefaultPlugin:
+            @hookimpl
+            def hello(self, arg, new_arg="impl"):
+                seen.append(("default", arg, new_arg))
+                return "default"
+
+        class WrapperPlugin:
+            @hookimpl(**wrapper_kind)
+            def hello(self, arg, new_arg="impl"):
+                seen.append(("wrapper-before", arg, new_arg))
+                result = yield
+                seen.append(("wrapper-after", arg, new_arg))
+                if wrapper_kind.get("hookwrapper"):
+                    return
+                return result
+
+        pm.add_hookspecs(Api)
+        pm.register(OldPlugin())
+        pm.register(NewPlugin())
+        pm.register(DefaultPlugin())
+        pm.register(WrapperPlugin())
+
+        assert pm.hook.hello(arg=1) == ["default", "new", "old"]
+        assert pm.hook.hello(arg=2, new_arg=None) == ["default", "new", "old"]
+        assert pm.hook.hello(arg=3, new_arg="value") == [
+            "default",
+            "new",
+            "old",
+        ]
+
+        assert seen == [
+            ("wrapper-before", 1, "spec"),
+            ("default", 1, "spec"),
+            ("new", 1, "spec"),
+            ("old", 1),
+            ("wrapper-after", 1, "spec"),
+            ("wrapper-before", 2, None),
+            ("default", 2, None),
+            ("new", 2, None),
+            ("old", 2),
+            ("wrapper-after", 2, None),
+            ("wrapper-before", 3, "value"),
+            ("default", 3, "value"),
+            ("new", 3, "value"),
+            ("old", 3),
+            ("wrapper-after", 3, "value"),
+        ]
+
+    def test_keyword_only_default(self, pm: PluginManager) -> None:
+        class Api:
+            @hookspec
+            def hello(self, arg, *, new_arg="spec"):
+                pass
+
+        pm.add_hookspecs(Api)
+
+        class OldPlugin:
+            @hookimpl
+            def hello(self, arg):
+                return arg
+
+        class NewPlugin:
+            @hookimpl
+            def hello(self, arg, *, new_arg="impl"):
+                return arg, new_arg
+
+        pm.register(OldPlugin())
+        pm.register(NewPlugin())
+
+        assert pm.hook.hello(arg=1) == [(1, "spec"), 1]
+        assert pm.hook.hello(arg=2, new_arg=None) == [(2, None), 2]
+
+    def test_var_keyword_receives_explicit_bindings(self, pm: PluginManager) -> None:
+        class Api:
+            @hookspec
+            def hello(self, arg, new_arg="spec"):
+                pass
+
+        class Plugin:
+            @hookimpl
+            def hello(self, arg, **kwargs):
+                return arg, kwargs
+
+        pm.add_hookspecs(Api)
+        pm.register(Plugin())
+
+        assert pm.hook.hello(arg=1) == [(1, {"new_arg": "spec"})]
+        assert pm.hook.hello(arg=2, new_arg=None) == [(2, {"new_arg": None})]
+
+    def test_unknown_required_keyword_only_argument_is_invalid(
+        self, pm: PluginManager
+    ) -> None:
+        class Api:
+            @hookspec
+            def hello(self, arg):
+                pass
+
+        class Plugin:
+            @hookimpl
+            def hello(self, arg, *, new_arg):
+                pass
+
+        pm.add_hookspecs(Api)
+
+        with pytest.raises(PluginValidationError, match="new_arg"):
+            pm.register(Plugin())
+
+    def test_positional_only_argument_is_invalid(self, pm: PluginManager) -> None:
+        class Api:
+            @hookspec
+            def hello(self, arg):
+                pass
+
+        class Plugin:
+            @hookimpl
+            def hello(self, arg, /):
+                pass
+
+        pm.add_hookspecs(Api)
+
+        with pytest.raises(PluginValidationError, match="Positional-only"):
+            pm.register(Plugin())
+
+    def test_positional_only_spec_argument_is_invalid(
+        self, pm: PluginManager
+    ) -> None:
+        class Api:
+            @hookspec
+            def hello(self, arg, /):
+                pass
+
+        with pytest.raises(ValueError, match="Positional-only"):
+            pm.add_hookspecs(Api)
